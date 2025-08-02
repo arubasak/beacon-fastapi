@@ -48,6 +48,15 @@ logger.info(f"🔧 CONFIG CHECK:")
 logger.info(f"SQLite Cloud: {'SET' if SQLITE_CLOUD_CONNECTION else 'MISSING'}")
 logger.info(f"Zoho Enabled: {ZOHO_ENABLED}")
 
+# Graceful fallback for optional imports (copied from fifi.py)
+SQLITECLOUD_AVAILABLE = False
+try:
+    import sqlitecloud
+    SQLITECLOUD_AVAILABLE = True
+except ImportError:
+    logger.warning("SQLiteCloud SDK not available. Emergency beacon will use local SQLite if not configured.")
+
+
 # Models
 class EmergencySaveRequest(BaseModel):
     session_id: str
@@ -108,31 +117,35 @@ def safe_json_loads(data: Optional[str], default_value: Any = None) -> Any:
     except (json.JSONDecodeError, TypeError):
         return default_value
 
-# Database Manager
+# Database Manager (Modified for robustness)
 class DatabaseManager:
     def __init__(self, connection_string: Optional[str]):
         self.lock = threading.Lock()
         self.conn = None
         self.connection_string = connection_string
+        self._last_health_check = None # Added for health checks
+        self._health_check_interval = timedelta(minutes=5) # Added for health checks
         
         logger.info("🔄 INITIALIZING DATABASE MANAGER")
         
-        # Try SQLite Cloud first
-        if connection_string:
+        self.db_type = "memory" # Default to memory initially
+        
+        # Prioritize SQLite Cloud if configured and available
+        if connection_string and SQLITECLOUD_AVAILABLE:
             try:
-                import sqlitecloud
                 self.conn = sqlitecloud.connect(connection_string)
-                # Test the connection
-                test_result = self.conn.execute("SELECT 1").fetchone()
-                logger.info(f"✅ SQLite Cloud connection established! Test result: {test_result}")
+                self.conn.execute("SELECT 1").fetchone()
+                logger.info(f"✅ SQLite Cloud connection established! Test result: {self.conn.execute('SELECT 1').fetchone()}")
                 self.db_type = "cloud"
             except Exception as e:
                 logger.error(f"❌ SQLite Cloud connection failed: {e}")
                 self.conn = None
+        elif connection_string:
+            logger.warning("❌ SQLite Cloud connection string provided but sqlitecloud library is not available.")
         else:
             logger.warning("❌ No SQLite Cloud connection string provided")
         
-        # Fallback to local SQLite
+        # Fallback to local SQLite if cloud connection failed or not attempted
         if not self.conn:
             try:
                 self.conn = sqlite3.connect("fifi_sessions_emergency.db", check_same_thread=False)
@@ -145,48 +158,140 @@ class DatabaseManager:
                 self.db_type = "memory"
                 self.local_sessions = {}
 
-    def test_connection(self) -> Dict[str, Any]:
-        """Test database connection and return status"""
-        try:
-            if not self.conn:
-                return {"status": "no_connection", "type": self.db_type}
-            
-            # Test basic query
-            if self.db_type == "cloud":
-                result = self.conn.execute("SELECT 1 as test").fetchone()
-                connection_type = "SQLite Cloud"
-            else:
-                result = self.conn.execute("SELECT 1 as test").fetchone()
-                connection_type = f"Local ({self.db_type})"
-            
-            # Test sessions table access
+        # Initialize database schema after determining connection type
+        if self.conn:
             try:
-                count_result = self.conn.execute("SELECT COUNT(*) FROM sessions").fetchone()
-                total_sessions = count_result[0] if count_result else 0
+                self._init_complete_database()
+                logger.info("✅ Database initialization completed successfully")
+            except Exception as e:
+                logger.error(f"Database initialization failed: {e}", exc_info=True)
+                self.conn = None
+                self.db_type = "memory"
+                self.local_sessions = {} # Ensure local_sessions exists if falling back
+
+    def _init_complete_database(self):
+        """Initialize database schema with all columns upfront (copied from fifi.py)"""
+        with self.lock:
+            try:
+                if hasattr(self.conn, 'row_factory'): 
+                    self.conn.row_factory = None
+
+                self.conn.execute('''
+                    CREATE TABLE IF NOT EXISTS sessions (
+                        session_id TEXT PRIMARY KEY,
+                        user_type TEXT DEFAULT 'guest',
+                        email TEXT,
+                        full_name TEXT,
+                        zoho_contact_id TEXT,
+                        created_at TEXT DEFAULT '',
+                        last_activity TEXT DEFAULT '',
+                        messages TEXT DEFAULT '[]',
+                        active INTEGER DEFAULT 1,
+                        fingerprint_id TEXT,
+                        fingerprint_method TEXT,
+                        visitor_type TEXT DEFAULT 'new_visitor',
+                        daily_question_count INTEGER DEFAULT 0,
+                        total_question_count INTEGER DEFAULT 0,
+                        last_question_time TEXT,
+                        question_limit_reached INTEGER DEFAULT 0,
+                        ban_status TEXT DEFAULT 'none',
+                        ban_start_time TEXT,
+                        ban_end_time TEXT,
+                        ban_reason TEXT,
+                        evasion_count INTEGER DEFAULT 0,
+                        current_penalty_hours INTEGER DEFAULT 0,
+                        escalation_level INTEGER DEFAULT 0,
+                        email_addresses_used TEXT DEFAULT '[]',
+                        email_switches_count INTEGER DEFAULT 0,
+                        browser_privacy_level TEXT,
+                        registration_prompted INTEGER DEFAULT 0,
+                        registration_link_clicked INTEGER DEFAULT 0,
+                        wp_token TEXT,
+                        timeout_saved_to_crm INTEGER DEFAULT 0,
+                        recognition_response TEXT
+                    )
+                ''')
                 
-                active_result = self.conn.execute("SELECT COUNT(*) FROM sessions WHERE active = 1").fetchone()
-                active_sessions = active_result[0] if active_result else 0
+                self.conn.execute("CREATE INDEX IF NOT EXISTS idx_session_lookup ON sessions(session_id, active)")
+                self.conn.execute("CREATE INDEX IF NOT EXISTS idx_fingerprint_id ON sessions(fingerprint_id)")
+                self.conn.execute("CREATE INDEX IF NOT EXISTS idx_email ON sessions(email)")
                 
-                return {
-                    "status": "connected",
-                    "type": connection_type,
-                    "test_query": result[0] if result else None,
-                    "total_sessions": total_sessions,
-                    "active_sessions": active_sessions
-                }
-            except Exception as table_error:
-                return {
-                    "status": "connected_but_table_error", 
-                    "type": connection_type,
-                    "table_error": str(table_error)
-                }
+                self.conn.commit()
+                logger.info("✅ Database schema ready and indexes created.")
                 
+            except Exception as e:
+                logger.error(f"Database initialization failed: {e}", exc_info=True)
+                raise
+
+    def _check_connection_health(self) -> bool:
+        """Check if database connection is healthy (copied from fifi.py)"""
+        if not self.conn:
+            return False
+            
+        now = datetime.now()
+        if (self._last_health_check and 
+            now - self._last_health_check < self._health_check_interval):
+            return True
+            
+        try:
+            self.conn.execute("SELECT 1").fetchone()
+            self._last_health_check = now
+            return True
         except Exception as e:
-            return {"status": "connection_failed", "error": str(e)}
+            logger.error(f"Database health check failed: {e}")
+            return False
+    
+    def _ensure_connection(self): 
+        """Ensure database connection is healthy, reconnect if needed (adapted from fifi.py)"""
+        if not self._check_connection_health():
+            logger.warning("Database connection unhealthy, attempting reconnection...")
+            old_conn = self.conn
+            self.conn = None
+            
+            if old_conn:
+                try:
+                    old_conn.close()
+                except Exception as e:
+                    logger.debug(f"Error closing old DB connection: {e}")
+            
+            if self.db_type == "cloud" and SQLITECLOUD_AVAILABLE:
+                try:
+                    self.conn = sqlitecloud.connect(self.connection_string)
+                    self.conn.execute("SELECT 1").fetchone()
+                    logger.info("✅ Reconnected to SQLite Cloud!")
+                except Exception as e:
+                    logger.error(f"❌ Reconnection to SQLite Cloud failed: {e}")
+                    self.conn = None
+            elif self.db_type == "file":
+                try:
+                    self.conn = sqlite3.connect("fifi_sessions_emergency.db", check_same_thread=False)
+                    self.conn.execute("SELECT 1").fetchone()
+                    logger.info("✅ Reconnected to local SQLite!")
+                except Exception as e:
+                    logger.error(f"❌ Reconnection to local SQLite failed: {e}")
+                    self.conn = None
+                
+            if not self.conn:
+                logger.error("Database reconnection failed, falling back to in-memory storage")
+                self.db_type = "memory"
+                if not hasattr(self, 'local_sessions'):
+                    self.local_sessions = {}
+            else:
+                try:
+                    self._init_complete_database()
+                except Exception as e:
+                    logger.error(f"Error re-initializing schema after reconnect: {e}")
+                    self.conn = None
+                    self.db_type = "memory"
+                    if not hasattr(self, 'local_sessions'):
+                        self.local_sessions = {}
+
 
     def load_session(self, session_id: str) -> Optional[UserSession]:
-        """Load session with exact same query structure as Streamlit"""
+        """Load session with complete SQLite Cloud compatibility and connection health check"""
         with self.lock:
+            self._ensure_connection() # Added connection check here
+
             if self.db_type == "memory":
                 session = self.local_sessions.get(session_id)
                 if session and isinstance(session.user_type, str):
@@ -197,11 +302,9 @@ class DatabaseManager:
                 return copy.deepcopy(session)
             
             try:
-                # NEVER set row_factory for cloud connections - always use raw tuples
                 if hasattr(self.conn, 'row_factory'):
                     self.conn.row_factory = None
                 
-                # Use EXACT same column order and query as Streamlit fifi.py
                 cursor = self.conn.execute("""
                     SELECT session_id, user_type, email, full_name, zoho_contact_id, 
                            created_at, last_activity, messages, active, wp_token, 
@@ -220,13 +323,11 @@ class DatabaseManager:
                     logger.debug(f"No active session found for ID {session_id[:8]}")
                     return None
                 
-                # Handle as tuple (SQLite Cloud returns tuples)
                 expected_cols = 31
                 if len(row) < expected_cols:
                     logger.error(f"Row has insufficient columns: {len(row)} (expected {expected_cols}) for session {session_id[:8]}")
                     return None
                 
-                # Log what we found for debugging
                 messages_data = safe_json_loads(row[7], [])
                 logger.info(f"Found session {session_id[:8]}: email={row[2]}, user_type={row[1]}, messages_count={len(messages_data)}, daily_questions={row[14]}")
                 
@@ -275,27 +376,12 @@ class DatabaseManager:
                     
             except Exception as e:
                 logger.error(f"Database query failed for session {session_id[:8]}: {e}", exc_info=True)
-                
-                # Try a simpler query to test basic connectivity
-                try:
-                    test_cursor = self.conn.execute("SELECT COUNT(*) FROM sessions WHERE session_id = ?", (session_id,))
-                    count = test_cursor.fetchone()[0]
-                    logger.info(f"Simple count query found {count} records for session {session_id[:8]}")
-                    
-                    # Try to get basic session info
-                    basic_cursor = self.conn.execute("SELECT session_id, email, daily_question_count FROM sessions WHERE session_id = ?", (session_id,))
-                    basic_row = basic_cursor.fetchone()
-                    if basic_row:
-                        logger.info(f"Basic session data: ID={basic_row[0][:8]}, email={basic_row[1]}, questions={basic_row[2]}")
-                    
-                except Exception as test_error:
-                    logger.error(f"Even simple query failed: {test_error}")
-                
                 return None
 
     def save_session(self, session: UserSession):
-        """Save session with SQLite Cloud compatibility"""
+        """Save session with SQLite Cloud compatibility and connection health check"""
         with self.lock:
+            self._ensure_connection() # Added connection check here
             if self.db_type == "memory":
                 self.local_sessions[session.session_id] = copy.deepcopy(session)
                 return
@@ -304,7 +390,6 @@ class DatabaseManager:
                 if hasattr(self.conn, 'row_factory'):
                     self.conn.row_factory = None
                 
-                # Ensure JSON serializable data
                 try:
                     json_messages = json.dumps(session.messages)
                     json_emails_used = json.dumps(session.email_addresses_used)
@@ -330,7 +415,7 @@ class DatabaseManager:
                     session.zoho_contact_id, session.created_at.isoformat(),
                     session.last_activity.isoformat(), json_messages, int(session.active),
                     session.wp_token, int(session.timeout_saved_to_crm), session.fingerprint_id,
-                    session.fingerprint_method, session.visitor_type, session.daily_question_count,
+                    session.fingeract_method, session.visitor_type, session.daily_question_count,
                     session.total_question_count,
                     session.last_question_time.isoformat() if session.last_question_time else None,
                     int(session.question_limit_reached), session.ban_status.value,
@@ -348,8 +433,9 @@ class DatabaseManager:
                 logger.error(f"Failed to save session {session.session_id[:8]}: {e}")
 
     def get_all_active_sessions(self) -> List[UserSession]:
-        """Get all active sessions for cleanup operations"""
+        """Get all active sessions for cleanup operations (with connection check)"""
         with self.lock:
+            self._ensure_connection() # Added connection check here
             if self.db_type == "memory":
                 return [copy.deepcopy(s) for s in self.local_sessions.values() if s.active]
             
@@ -419,7 +505,7 @@ class DatabaseManager:
                 logger.error(f"Failed to get active sessions: {e}")
                 return []
 
-# PDF Exporter
+# PDF Exporter (Unchanged - already robust enough for FastAPI context)
 class PDFExporter:
     def __init__(self):
         self.styles = getSampleStyleSheet()
@@ -431,7 +517,6 @@ class PDFExporter:
             doc = SimpleDocTemplate(buffer, pagesize=letter)
             story = [Paragraph("FiFi AI Emergency Save Transcript", self.styles['Heading1'])]
             
-            # Add session info
             story.append(Paragraph(f"Session ID: {session.session_id}", self.styles['Normal']))
             story.append(Paragraph(f"User: {session.full_name or 'Anonymous'} ({session.email or 'No email'})", self.styles['Normal']))
             story.append(Paragraph(f"Created: {session.created_at.strftime('%Y-%m-%d %H:%M:%S')}", self.styles['Normal']))
@@ -453,7 +538,7 @@ class PDFExporter:
             logger.error(f"PDF generation failed: {e}")
             return None
 
-# Zoho CRM Manager
+# Zoho CRM Manager (Unchanged - relies on external configs and token refresh)
 class ZohoCRMManager:
     def __init__(self, pdf_exporter: PDFExporter):
         self.pdf_exporter = pdf_exporter
@@ -618,21 +703,26 @@ zoho_manager = ZohoCRMManager(pdf_exporter)
 def is_crm_eligible(session: UserSession) -> bool:
     try:
         if not session.email or not session.messages:
+            logger.debug(f"CRM Eligibility: Missing email ({bool(session.email)}) or messages ({bool(session.messages)})")
             return False
         
         if session.user_type not in [UserType.REGISTERED_USER, UserType.EMAIL_VERIFIED_GUEST]:
+            logger.debug(f"CRM Eligibility: User type {session.user_type.value} not eligible.")
             return False
             
         if session.daily_question_count < 1:
+            logger.debug(f"CRM Eligibility: No questions asked ({session.daily_question_count}).")
             return False
             
-        # 15-minute check
         elapsed_time = datetime.now() - session.created_at
         if elapsed_time.total_seconds() / 60 < 15.0:
+            logger.debug(f"CRM Eligibility: Less than 15 minutes active ({elapsed_time.total_seconds() / 60:.1f} min).")
             return False
             
+        logger.debug("CRM Eligibility: All checks passed.")
         return True
-    except Exception:
+    except Exception as e:
+        logger.error(f"Error checking CRM eligibility: {e}")
         return False
 
 # API Endpoints
@@ -655,10 +745,8 @@ async def health_check():
 async def debug_database():
     """Debug endpoint to test database connection and session access"""
     try:
-        # Test connection
         db_status = db_manager.test_connection()
         
-        # Test recent sessions
         try:
             recent_sessions = []
             if db_manager.conn:
@@ -710,10 +798,10 @@ async def emergency_save(request: EmergencySaveRequest, background_tasks: Backgr
         
         session = db_manager.load_session(request.session_id)
         if not session:
-            logger.error(f"Session {request.session_id[:8]} not found")
+            logger.error(f"Session {request.session_id[:8]} not found or not active in DB")
             return {
                 "success": False,
-                "message": "Session not found",
+                "message": "Session not found or not active",
                 "session_id": request.session_id,
                 "reason": "session_not_found"
             }
@@ -721,7 +809,7 @@ async def emergency_save(request: EmergencySaveRequest, background_tasks: Backgr
         logger.info(f"Session loaded: email={session.email}, user_type={session.user_type.value}, messages={len(session.messages)}, questions={session.daily_question_count}")
         
         if not is_crm_eligible(session):
-            logger.info(f"Session {request.session_id[:8]} not eligible for CRM")
+            logger.info(f"Session {request.session_id[:8]} not eligible for CRM save based on current criteria.")
             return {
                 "success": False,
                 "message": "Session not eligible for CRM save",
@@ -729,6 +817,15 @@ async def emergency_save(request: EmergencySaveRequest, background_tasks: Backgr
                 "reason": "not_eligible"
             }
         
+        if session.timeout_saved_to_crm:
+            logger.info(f"Session {request.session_id[:8]} already marked as saved to CRM. Skipping duplicate save.")
+            return {
+                "success": True,
+                "message": "Session already saved to CRM, no action needed.",
+                "session_id": request.session_id,
+                "reason": "already_saved"
+            }
+
         # Perform CRM save in background to avoid timeout
         background_tasks.add_task(
             _perform_emergency_crm_save,
@@ -791,15 +888,15 @@ async def cleanup_expired_sessions():
         raise HTTPException(status_code=500, detail=str(e))
 
 async def _perform_emergency_crm_save(session, reason: str):
-    """Background task to perform CRM save"""
+    """Background task to perform CRM save and update session status"""
     try:
         save_success = zoho_manager.save_chat_transcript_sync(session, reason)
         
         if save_success:
             session.timeout_saved_to_crm = True
-            session.last_activity = datetime.now()
-            db_manager.save_session(session)
-            logger.info(f"✅ Background CRM save successful for session {session.session_id[:8]}")
+            session.last_activity = datetime.now() # Update last activity as it was just processed
+            db_manager.save_session(session) # Persist the timeout_saved_to_crm flag
+            logger.info(f"✅ Background CRM save successful and flag updated for session {session.session_id[:8]}")
         else:
             logger.error(f"❌ Background CRM save failed for session {session.session_id[:8]}")
             
