@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel, Field
 from fastapi.middleware.cors import CORSMiddleware
 import logging
@@ -44,6 +44,10 @@ ZOHO_CLIENT_SECRET = os.getenv("ZOHO_CLIENT_SECRET")
 ZOHO_REFRESH_TOKEN = os.getenv("ZOHO_REFRESH_TOKEN")
 ZOHO_ENABLED = all([ZOHO_CLIENT_ID, ZOHO_CLIENT_SECRET, ZOHO_REFRESH_TOKEN])
 
+logger.info(f"🔧 CONFIG CHECK:")
+logger.info(f"SQLite Cloud: {'SET' if SQLITE_CLOUD_CONNECTION else 'MISSING'}")
+logger.info(f"Zoho Enabled: {ZOHO_ENABLED}")
+
 # Models
 class EmergencySaveRequest(BaseModel):
     session_id: str
@@ -69,16 +73,31 @@ class UserSession:
     full_name: Optional[str] = None
     zoho_contact_id: Optional[str] = None
     active: bool = True
+    wp_token: Optional[str] = None
     messages: List[Dict[str, Any]] = field(default_factory=list)
     created_at: datetime = field(default_factory=datetime.now)
     last_activity: datetime = field(default_factory=datetime.now)
     timeout_saved_to_crm: bool = False
+    fingerprint_id: Optional[str] = None
+    fingerprint_method: Optional[str] = None
+    visitor_type: str = "new_visitor"
+    recognition_response: Optional[str] = None
     daily_question_count: int = 0
     total_question_count: int = 0
     last_question_time: Optional[datetime] = None
+    question_limit_reached: bool = False
     ban_status: BanStatus = BanStatus.NONE
+    ban_start_time: Optional[datetime] = None
     ban_end_time: Optional[datetime] = None
+    ban_reason: Optional[str] = None
+    evasion_count: int = 0
+    current_penalty_hours: int = 0
+    escalation_level: int = 0
     email_addresses_used: List[str] = field(default_factory=list)
+    email_switches_count: int = 0
+    browser_privacy_level: Optional[str] = None
+    registration_prompted: bool = False
+    registration_link_clicked: bool = False
 
 # Utility functions
 def safe_json_loads(data: Optional[str], default_value: Any = None) -> Any:
@@ -94,18 +113,24 @@ class DatabaseManager:
     def __init__(self, connection_string: Optional[str]):
         self.lock = threading.Lock()
         self.conn = None
+        self.connection_string = connection_string
+        
+        logger.info("🔄 INITIALIZING DATABASE MANAGER")
         
         # Try SQLite Cloud first
         if connection_string:
             try:
                 import sqlitecloud
                 self.conn = sqlitecloud.connect(connection_string)
-                self.conn.execute("SELECT 1").fetchone()
-                logger.info("✅ SQLite Cloud connection established!")
+                # Test the connection
+                test_result = self.conn.execute("SELECT 1").fetchone()
+                logger.info(f"✅ SQLite Cloud connection established! Test result: {test_result}")
                 self.db_type = "cloud"
             except Exception as e:
-                logger.error(f"SQLite Cloud failed: {e}")
+                logger.error(f"❌ SQLite Cloud connection failed: {e}")
                 self.conn = None
+        else:
+            logger.warning("❌ No SQLite Cloud connection string provided")
         
         # Fallback to local SQLite
         if not self.conn:
@@ -115,55 +140,161 @@ class DatabaseManager:
                 logger.info("✅ Local SQLite connection established!")
                 self.db_type = "file"
             except Exception as e:
-                logger.error(f"Local SQLite failed: {e}")
+                logger.error(f"❌ Local SQLite connection failed: {e}")
                 self.conn = None
                 self.db_type = "memory"
                 self.local_sessions = {}
 
+    def test_connection(self) -> Dict[str, Any]:
+        """Test database connection and return status"""
+        try:
+            if not self.conn:
+                return {"status": "no_connection", "type": self.db_type}
+            
+            # Test basic query
+            if self.db_type == "cloud":
+                result = self.conn.execute("SELECT 1 as test").fetchone()
+                connection_type = "SQLite Cloud"
+            else:
+                result = self.conn.execute("SELECT 1 as test").fetchone()
+                connection_type = f"Local ({self.db_type})"
+            
+            # Test sessions table access
+            try:
+                count_result = self.conn.execute("SELECT COUNT(*) FROM sessions").fetchone()
+                total_sessions = count_result[0] if count_result else 0
+                
+                active_result = self.conn.execute("SELECT COUNT(*) FROM sessions WHERE active = 1").fetchone()
+                active_sessions = active_result[0] if active_result else 0
+                
+                return {
+                    "status": "connected",
+                    "type": connection_type,
+                    "test_query": result[0] if result else None,
+                    "total_sessions": total_sessions,
+                    "active_sessions": active_sessions
+                }
+            except Exception as table_error:
+                return {
+                    "status": "connected_but_table_error", 
+                    "type": connection_type,
+                    "table_error": str(table_error)
+                }
+                
+        except Exception as e:
+            return {"status": "connection_failed", "error": str(e)}
+
     def load_session(self, session_id: str) -> Optional[UserSession]:
+        """Load session with exact same query structure as Streamlit"""
         with self.lock:
             if self.db_type == "memory":
-                return copy.deepcopy(self.local_sessions.get(session_id))
+                session = self.local_sessions.get(session_id)
+                if session and isinstance(session.user_type, str):
+                    try:
+                        session.user_type = UserType(session.user_type)
+                    except ValueError:
+                        session.user_type = UserType.GUEST
+                return copy.deepcopy(session)
             
             try:
+                # NEVER set row_factory for cloud connections - always use raw tuples
                 if hasattr(self.conn, 'row_factory'):
                     self.conn.row_factory = None
                 
+                # Use EXACT same column order and query as Streamlit fifi.py
                 cursor = self.conn.execute("""
                     SELECT session_id, user_type, email, full_name, zoho_contact_id, 
-                           created_at, last_activity, messages, active, timeout_saved_to_crm,
-                           daily_question_count, total_question_count, last_question_time,
-                           ban_status, ban_end_time, email_addresses_used
+                           created_at, last_activity, messages, active, wp_token, 
+                           timeout_saved_to_crm, fingerprint_id, fingerprint_method, 
+                           visitor_type, daily_question_count, total_question_count, 
+                           last_question_time, question_limit_reached, ban_status, 
+                           ban_start_time, ban_end_time, ban_reason, evasion_count, 
+                           current_penalty_hours, escalation_level, email_addresses_used, 
+                           email_switches_count, browser_privacy_level, registration_prompted, 
+                           registration_link_clicked, recognition_response 
                     FROM sessions WHERE session_id = ? AND active = 1
                 """, (session_id,))
                 row = cursor.fetchone()
                 
                 if not row:
+                    logger.debug(f"No active session found for ID {session_id[:8]}")
                     return None
                 
-                return UserSession(
-                    session_id=row[0],
-                    user_type=UserType(row[1]) if row[1] else UserType.GUEST,
-                    email=row[2],
-                    full_name=row[3],
-                    zoho_contact_id=row[4],
-                    created_at=datetime.fromisoformat(row[5]) if row[5] else datetime.now(),
-                    last_activity=datetime.fromisoformat(row[6]) if row[6] else datetime.now(),
-                    messages=safe_json_loads(row[7], []),
-                    active=bool(row[8]),
-                    timeout_saved_to_crm=bool(row[9]),
-                    daily_question_count=row[10] or 0,
-                    total_question_count=row[11] or 0,
-                    last_question_time=datetime.fromisoformat(row[12]) if row[12] else None,
-                    ban_status=BanStatus(row[13]) if row[13] else BanStatus.NONE,
-                    ban_end_time=datetime.fromisoformat(row[14]) if row[14] else None,
-                    email_addresses_used=safe_json_loads(row[15], [])
-                )
+                # Handle as tuple (SQLite Cloud returns tuples)
+                expected_cols = 31
+                if len(row) < expected_cols:
+                    logger.error(f"Row has insufficient columns: {len(row)} (expected {expected_cols}) for session {session_id[:8]}")
+                    return None
+                
+                # Log what we found for debugging
+                messages_data = safe_json_loads(row[7], [])
+                logger.info(f"Found session {session_id[:8]}: email={row[2]}, user_type={row[1]}, messages_count={len(messages_data)}, daily_questions={row[14]}")
+                
+                try:
+                    user_session = UserSession(
+                        session_id=row[0],
+                        user_type=UserType(row[1]) if row[1] else UserType.GUEST,
+                        email=row[2],
+                        full_name=row[3],
+                        zoho_contact_id=row[4],
+                        created_at=datetime.fromisoformat(row[5]) if row[5] else datetime.now(),
+                        last_activity=datetime.fromisoformat(row[6]) if row[6] else datetime.now(),
+                        messages=messages_data,
+                        active=bool(row[8]),
+                        wp_token=row[9],
+                        timeout_saved_to_crm=bool(row[10]),
+                        fingerprint_id=row[11],
+                        fingerprint_method=row[12],
+                        visitor_type=row[13] or 'new_visitor',
+                        daily_question_count=row[14] or 0,
+                        total_question_count=row[15] or 0,
+                        last_question_time=datetime.fromisoformat(row[16]) if row[16] else None,
+                        question_limit_reached=bool(row[17]),
+                        ban_status=BanStatus(row[18]) if row[18] else BanStatus.NONE,
+                        ban_start_time=datetime.fromisoformat(row[19]) if row[19] else None,
+                        ban_end_time=datetime.fromisoformat(row[20]) if row[20] else None,
+                        ban_reason=row[21],
+                        evasion_count=row[22] or 0,
+                        current_penalty_hours=row[23] or 0,
+                        escalation_level=row[24] or 0,
+                        email_addresses_used=safe_json_loads(row[25], []),
+                        email_switches_count=row[26] or 0,
+                        browser_privacy_level=row[27],
+                        registration_prompted=bool(row[28]),
+                        registration_link_clicked=bool(row[29]),
+                        recognition_response=row[30]
+                    )
+                    
+                    logger.info(f"Successfully loaded session {session_id[:8]}: user_type={user_session.user_type.value}, messages={len(user_session.messages)}")
+                    return user_session
+                    
+                except Exception as e:
+                    logger.error(f"Failed to create UserSession object from row for session {session_id[:8]}: {e}", exc_info=True)
+                    logger.error(f"Problematic row data (first 10 fields): {str(row[:10])}")
+                    return None
+                    
             except Exception as e:
-                logger.error(f"Failed to load session {session_id[:8]}: {e}")
+                logger.error(f"Database query failed for session {session_id[:8]}: {e}", exc_info=True)
+                
+                # Try a simpler query to test basic connectivity
+                try:
+                    test_cursor = self.conn.execute("SELECT COUNT(*) FROM sessions WHERE session_id = ?", (session_id,))
+                    count = test_cursor.fetchone()[0]
+                    logger.info(f"Simple count query found {count} records for session {session_id[:8]}")
+                    
+                    # Try to get basic session info
+                    basic_cursor = self.conn.execute("SELECT session_id, email, daily_question_count FROM sessions WHERE session_id = ?", (session_id,))
+                    basic_row = basic_cursor.fetchone()
+                    if basic_row:
+                        logger.info(f"Basic session data: ID={basic_row[0][:8]}, email={basic_row[1]}, questions={basic_row[2]}")
+                    
+                except Exception as test_error:
+                    logger.error(f"Even simple query failed: {test_error}")
+                
                 return None
 
     def save_session(self, session: UserSession):
+        """Save session with SQLite Cloud compatibility"""
         with self.lock:
             if self.db_type == "memory":
                 self.local_sessions[session.session_id] = copy.deepcopy(session)
@@ -173,29 +304,51 @@ class DatabaseManager:
                 if hasattr(self.conn, 'row_factory'):
                     self.conn.row_factory = None
                 
-                self.conn.execute("""
+                # Ensure JSON serializable data
+                try:
+                    json_messages = json.dumps(session.messages)
+                    json_emails_used = json.dumps(session.email_addresses_used)
+                except (TypeError, ValueError) as e:
+                    logger.error(f"Session data not JSON serializable for {session.session_id[:8]}: {e}")
+                    json_messages = "[]"
+                    json_emails_used = "[]"
+                
+                self.conn.execute('''
                     REPLACE INTO sessions (
-                        session_id, user_type, email, full_name, zoho_contact_id,
-                        created_at, last_activity, messages, active, timeout_saved_to_crm,
-                        daily_question_count, total_question_count, last_question_time,
-                        ban_status, ban_end_time, email_addresses_used
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
+                        session_id, user_type, email, full_name, zoho_contact_id, 
+                        created_at, last_activity, messages, active, wp_token, 
+                        timeout_saved_to_crm, fingerprint_id, fingerprint_method, 
+                        visitor_type, daily_question_count, total_question_count, 
+                        last_question_time, question_limit_reached, ban_status, 
+                        ban_start_time, ban_end_time, ban_reason, evasion_count, 
+                        current_penalty_hours, escalation_level, email_addresses_used, 
+                        email_switches_count, browser_privacy_level, registration_prompted, 
+                        registration_link_clicked, recognition_response
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
                     session.session_id, session.user_type.value, session.email, session.full_name,
                     session.zoho_contact_id, session.created_at.isoformat(),
-                    session.last_activity.isoformat(), json.dumps(session.messages),
-                    int(session.active), int(session.timeout_saved_to_crm),
-                    session.daily_question_count, session.total_question_count,
+                    session.last_activity.isoformat(), json_messages, int(session.active),
+                    session.wp_token, int(session.timeout_saved_to_crm), session.fingerprint_id,
+                    session.fingerprint_method, session.visitor_type, session.daily_question_count,
+                    session.total_question_count,
                     session.last_question_time.isoformat() if session.last_question_time else None,
-                    session.ban_status.value,
+                    int(session.question_limit_reached), session.ban_status.value,
+                    session.ban_start_time.isoformat() if session.ban_start_time else None,
                     session.ban_end_time.isoformat() if session.ban_end_time else None,
-                    json.dumps(session.email_addresses_used)
+                    session.ban_reason, session.evasion_count, session.current_penalty_hours,
+                    session.escalation_level, json_emails_used,
+                    session.email_switches_count, session.browser_privacy_level,
+                    int(session.registration_prompted), int(session.registration_link_clicked),
+                    session.recognition_response
                 ))
                 self.conn.commit()
+                logger.debug(f"Successfully saved session {session.session_id[:8]}")
             except Exception as e:
                 logger.error(f"Failed to save session {session.session_id[:8]}: {e}")
 
     def get_all_active_sessions(self) -> List[UserSession]:
+        """Get all active sessions for cleanup operations"""
         with self.lock:
             if self.db_type == "memory":
                 return [copy.deepcopy(s) for s in self.local_sessions.values() if s.active]
@@ -203,19 +356,28 @@ class DatabaseManager:
             try:
                 if hasattr(self.conn, 'row_factory'):
                     self.conn.row_factory = None
-                
+
                 cursor = self.conn.execute("""
-                    SELECT session_id, user_type, email, full_name, zoho_contact_id,
-                           created_at, last_activity, messages, active, timeout_saved_to_crm,
-                           daily_question_count, total_question_count, last_question_time,
-                           ban_status, ban_end_time, email_addresses_used
+                    SELECT session_id, user_type, email, full_name, zoho_contact_id, 
+                           created_at, last_activity, messages, active, wp_token, 
+                           timeout_saved_to_crm, fingerprint_id, fingerprint_method, 
+                           visitor_type, daily_question_count, total_question_count, 
+                           last_question_time, question_limit_reached, ban_status, 
+                           ban_start_time, ban_end_time, ban_reason, evasion_count, 
+                           current_penalty_hours, escalation_level, email_addresses_used, 
+                           email_switches_count, browser_privacy_level, registration_prompted, 
+                           registration_link_clicked, recognition_response 
                     FROM sessions WHERE active = 1 ORDER BY last_activity ASC
                 """)
                 
                 sessions = []
+                expected_cols = 31
                 for row in cursor.fetchall():
+                    if len(row) < expected_cols:
+                        logger.warning(f"Row has insufficient columns: {len(row)} (expected {expected_cols}). Skipping.")
+                        continue
                     try:
-                        session = UserSession(
+                        s = UserSession(
                             session_id=row[0],
                             user_type=UserType(row[1]) if row[1] else UserType.GUEST,
                             email=row[2],
@@ -225,15 +387,30 @@ class DatabaseManager:
                             last_activity=datetime.fromisoformat(row[6]) if row[6] else datetime.now(),
                             messages=safe_json_loads(row[7], []),
                             active=bool(row[8]),
-                            timeout_saved_to_crm=bool(row[9]),
-                            daily_question_count=row[10] or 0,
-                            total_question_count=row[11] or 0,
-                            last_question_time=datetime.fromisoformat(row[12]) if row[12] else None,
-                            ban_status=BanStatus(row[13]) if row[13] else BanStatus.NONE,
-                            ban_end_time=datetime.fromisoformat(row[14]) if row[14] else None,
-                            email_addresses_used=safe_json_loads(row[15], [])
+                            wp_token=row[9],
+                            timeout_saved_to_crm=bool(row[10]),
+                            fingerprint_id=row[11],
+                            fingerprint_method=row[12],
+                            visitor_type=row[13] or 'new_visitor',
+                            daily_question_count=row[14] or 0,
+                            total_question_count=row[15] or 0,
+                            last_question_time=datetime.fromisoformat(row[16]) if row[16] else None,
+                            question_limit_reached=bool(row[17]),
+                            ban_status=BanStatus(row[18]) if row[18] else BanStatus.NONE,
+                            ban_start_time=datetime.fromisoformat(row[19]) if row[19] else None,
+                            ban_end_time=datetime.fromisoformat(row[20]) if row[20] else None,
+                            ban_reason=row[21],
+                            evasion_count=row[22] or 0,
+                            current_penalty_hours=row[23] or 0,
+                            escalation_level=row[24] or 0,
+                            email_addresses_used=safe_json_loads(row[25], []),
+                            email_switches_count=row[26] or 0,
+                            browser_privacy_level=row[27],
+                            registration_prompted=bool(row[28]),
+                            registration_link_clicked=bool(row[29]),
+                            recognition_response=row[30]
                         )
-                        sessions.append(session)
+                        sessions.append(s)
                     except Exception as e:
                         logger.error(f"Error converting row to session: {e}")
                         continue
@@ -252,9 +429,15 @@ class PDFExporter:
         try:
             buffer = io.BytesIO()
             doc = SimpleDocTemplate(buffer, pagesize=letter)
-            story = [Paragraph("FiFi AI Chat Transcript", self.styles['Heading1'])]
+            story = [Paragraph("FiFi AI Emergency Save Transcript", self.styles['Heading1'])]
             
-            for msg in session.messages:
+            # Add session info
+            story.append(Paragraph(f"Session ID: {session.session_id}", self.styles['Normal']))
+            story.append(Paragraph(f"User: {session.full_name or 'Anonymous'} ({session.email or 'No email'})", self.styles['Normal']))
+            story.append(Paragraph(f"Created: {session.created_at.strftime('%Y-%m-%d %H:%M:%S')}", self.styles['Normal']))
+            story.append(Spacer(1, 12))
+            
+            for i, msg in enumerate(session.messages):
                 role = str(msg.get('role', 'unknown')).capitalize()
                 content = html.escape(str(msg.get('content', '')))
                 content = re.sub(r'<[^>]+>', '', content)
@@ -335,7 +518,7 @@ class ZohoCRMManager:
                 "data": [{
                     "Last_Name": full_name or "Food Professional",
                     "Email": email,
-                    "Lead_Source": "FiFi AI Assistant Emergency Save"
+                    "Lead_Source": "FiFi AI Emergency API"
                 }]
             }
             response = requests.post(f"{self.base_url}/Contacts", headers=headers, json=contact_data, timeout=10)
@@ -379,13 +562,17 @@ class ZohoCRMManager:
 
     def save_chat_transcript_sync(self, session: UserSession, trigger_reason: str) -> bool:
         if not ZOHO_ENABLED or not session.email or not session.messages:
+            logger.info(f"Zoho save skipped: ZOHO_ENABLED={ZOHO_ENABLED}, email={bool(session.email)}, messages={len(session.messages)}")
             return False
         
         try:
+            logger.info(f"🔄 Starting Zoho CRM save for {session.session_id[:8]}")
+            
             contact_id = self._find_contact_by_email(session.email)
             if not contact_id:
                 contact_id = self._create_contact(session.email, session.full_name)
             if not contact_id:
+                logger.error("Failed to find or create Zoho contact")
                 return False
 
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -410,7 +597,14 @@ class ZohoCRMManager:
                     
                 note_content += f"\n{i+1}. **{role}:** {content}\n"
                 
-            return self._add_note(contact_id, note_title, note_content)
+            note_success = self._add_note(contact_id, note_title, note_content)
+            if note_success:
+                logger.info(f"✅ Zoho CRM save successful for {session.session_id[:8]}")
+                return True
+            else:
+                logger.error(f"❌ Zoho note creation failed for {session.session_id[:8]}")
+                return False
+                
         except Exception as e:
             logger.error(f"Emergency CRM save failed: {e}")
             return False
@@ -448,44 +642,116 @@ async def root():
 
 @app.get("/health")
 async def health_check():
+    db_status = db_manager.test_connection()
     return {
         "status": "healthy",
         "timestamp": datetime.now(),
-        "database": "connected" if db_manager.conn else "disconnected",
+        "database": db_status.get("status", "unknown"),
+        "database_type": db_status.get("type", "unknown"),
         "zoho": "enabled" if ZOHO_ENABLED else "disabled"
     }
 
-@app.post("/emergency-save")
-async def emergency_save(request: EmergencySaveRequest):
+@app.get("/debug-db")
+async def debug_database():
+    """Debug endpoint to test database connection and session access"""
     try:
-        logger.info(f"🚨 EMERGENCY SAVE: Request for session {request.session_id[:8]}")
+        # Test connection
+        db_status = db_manager.test_connection()
+        
+        # Test recent sessions
+        try:
+            recent_sessions = []
+            if db_manager.conn:
+                cursor = db_manager.conn.execute("""
+                    SELECT session_id, email, user_type, daily_question_count, 
+                           created_at, active, timeout_saved_to_crm
+                    FROM sessions 
+                    WHERE active = 1 
+                    ORDER BY last_activity DESC 
+                    LIMIT 5
+                """)
+                for row in cursor.fetchall():
+                    recent_sessions.append({
+                        "session_id": row[0][:8] + "...",
+                        "email": row[1],
+                        "user_type": row[2],
+                        "daily_questions": row[3],
+                        "created_at": row[4],
+                        "active": bool(row[5]),
+                        "saved_to_crm": bool(row[6])
+                    })
+        except Exception as query_error:
+            recent_sessions = f"Query failed: {str(query_error)}"
+        
+        return {
+            "database_status": db_status,
+            "recent_sessions": recent_sessions,
+            "env_check": {
+                "SQLITE_CLOUD_CONNECTION": "SET" if SQLITE_CLOUD_CONNECTION else "MISSING",
+                "ZOHO_CLIENT_ID": "SET" if ZOHO_CLIENT_ID else "MISSING",
+                "ZOHO_CLIENT_SECRET": "SET" if ZOHO_CLIENT_SECRET else "MISSING",
+                "ZOHO_REFRESH_TOKEN": "SET" if ZOHO_REFRESH_TOKEN else "MISSING"
+            },
+            "zoho_status": "enabled" if ZOHO_ENABLED else "disabled"
+        }
+    except Exception as e:
+        return {
+            "error": str(e),
+            "database_status": "FAILED",
+            "env_check": {
+                "SQLITE_CLOUD_CONNECTION": "SET" if SQLITE_CLOUD_CONNECTION else "MISSING"
+            }
+        }
+
+@app.post("/emergency-save")
+async def emergency_save(request: EmergencySaveRequest, background_tasks: BackgroundTasks):
+    try:
+        logger.info(f"🚨 EMERGENCY SAVE: Request for session {request.session_id[:8]}, reason: {request.reason}")
         
         session = db_manager.load_session(request.session_id)
         if not session:
             logger.error(f"Session {request.session_id[:8]} not found")
-            return {"success": False, "reason": "session_not_found"}
+            return {
+                "success": False,
+                "message": "Session not found",
+                "session_id": request.session_id,
+                "reason": "session_not_found"
+            }
+        
+        logger.info(f"Session loaded: email={session.email}, user_type={session.user_type.value}, messages={len(session.messages)}, questions={session.daily_question_count}")
         
         if not is_crm_eligible(session):
             logger.info(f"Session {request.session_id[:8]} not eligible for CRM")
-            return {"success": False, "reason": "not_eligible"}
+            return {
+                "success": False,
+                "message": "Session not eligible for CRM save",
+                "session_id": request.session_id,
+                "reason": "not_eligible"
+            }
         
-        save_success = zoho_manager.save_chat_transcript_sync(
-            session, f"Emergency Save: {request.reason}"
+        # Perform CRM save in background to avoid timeout
+        background_tasks.add_task(
+            _perform_emergency_crm_save,
+            session,
+            f"Emergency Save: {request.reason}"
         )
         
-        if save_success:
-            session.timeout_saved_to_crm = True
-            session.last_activity = datetime.now()
-            db_manager.save_session(session)
-            logger.info(f"✅ Emergency save successful for {request.session_id[:8]}")
-            return {"success": True, "saved_to_crm": True}
-        else:
-            logger.error(f"❌ Emergency save failed for {request.session_id[:8]}")
-            return {"success": False, "reason": "crm_failed"}
+        logger.info(f"✅ Emergency save queued for {request.session_id[:8]}")
+        return {
+            "success": True,
+            "message": "Emergency save queued successfully",
+            "session_id": request.session_id,
+            "saved_to_crm": True
+        }
             
     except Exception as e:
-        logger.error(f"Emergency save error: {e}")
-        return {"success": False, "reason": "internal_error"}
+        logger.error(f"Emergency save error: {e}", exc_info=True)
+        return {
+            "success": False,
+            "message": f"Internal error: {str(e)}",
+            "session_id": request.session_id,
+            "reason": "internal_error"
+        }
 
 @app.post("/cleanup-expired-sessions")
 async def cleanup_expired_sessions():
@@ -518,11 +784,27 @@ async def cleanup_expired_sessions():
                 results["errors"] += 1
         
         logger.info(f"🧹 CLEANUP COMPLETE: {results}")
-        return results
+        return {**results, "timestamp": datetime.now()}
         
     except Exception as e:
         logger.error(f"Cleanup error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+async def _perform_emergency_crm_save(session, reason: str):
+    """Background task to perform CRM save"""
+    try:
+        save_success = zoho_manager.save_chat_transcript_sync(session, reason)
+        
+        if save_success:
+            session.timeout_saved_to_crm = True
+            session.last_activity = datetime.now()
+            db_manager.save_session(session)
+            logger.info(f"✅ Background CRM save successful for session {session.session_id[:8]}")
+        else:
+            logger.error(f"❌ Background CRM save failed for session {session.session_id[:8]}")
+            
+    except Exception as e:
+        logger.error(f"Background CRM save error for session {session.session_id[:8]}: {e}")
 
 if __name__ == "__main__":
     import uvicorn
