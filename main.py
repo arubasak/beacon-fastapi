@@ -144,7 +144,7 @@ def is_session_ending_reason(reason: str) -> bool:
     ]
     
     reason_lower = reason.lower()
-    return any(keyword in reason_lower for keyword in reason_ending_keywords)
+    return any(keyword in reason_lower for keyword in session_ending_keywords)
 
 # FIXED: Database Manager with Cold Start Fix Only
 class ResilientDatabaseManager:
