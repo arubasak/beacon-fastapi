@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from fastapi.middleware.cors import CORSMiddleware
 import logging
@@ -28,7 +28,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # FastAPI app with startup event
-app = FastAPI(title="FiFi Emergency API - Complete Integrated Version", version="3.2.1")
+app = FastAPI(title="FiFi Emergency API - Complete Integrated Version", version="3.2.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -1334,13 +1334,14 @@ async def _perform_emergency_crm_save(session, reason: str):
 @app.get("/")
 async def root():
     return {
-        "message": "FiFi Emergency API - Cold Start Resilient (Cloud Run Optimized)",
+        "message": "FiFi Emergency API - FIXED: Synchronous Processing (Cloud Run Compatible)",
         "status": "running",
-        "version": "3.2.1-cloud-run-optimized",
+        "version": "3.2.2-synchronous-processing",
         "fixes_applied": [
             "MINIMAL FIX 1: Immediate session ending for browser close/refresh/timeout",
             "MINIMAL FIX 2: PDF attachment upload using working fifi.py approach",
-            "COLD START FIX: Enhanced connection recovery for Cloud Run auto-scaling"
+            "COLD START FIX: Enhanced connection recovery for Cloud Run auto-scaling",
+            "CRITICAL FIX: Synchronous processing to prevent Cloud Run premature shutdown"
         ],
         "working_features_preserved": [
             "SQLite Cloud API Key Authentication",
@@ -1355,7 +1356,8 @@ async def root():
             "Cold start detection and recovery",
             "Fresh connection initialization on startup",
             "Enhanced socket error handling",
-            "Auto-scaling resilient database connections"
+            "Auto-scaling resilient database connections",
+            "Synchronous CRM processing to prevent container shutdown"
         ],
         "session_ending_reasons": [
             "beforeunload", "unload", "close", "refresh", "timeout",
@@ -1402,7 +1404,7 @@ async def comprehensive_diagnostics():
     try:
         diagnostics = {
             "timestamp": datetime.now(),
-            "version": "3.2.0-conservative",
+            "version": "3.2.2-synchronous-processing",
             "environment": {
                 "SQLITE_CLOUD_CONNECTION": "SET" if SQLITE_CLOUD_CONNECTION else "MISSING",
                 "ZOHO_ENABLED": ZOHO_ENABLED,
@@ -1491,13 +1493,13 @@ async def cleanup_expired_sessions():
             "error_type": type(e).__name__
         }
 
-# Main Emergency Save Endpoint - Conservative Approach
+# Main Emergency Save Endpoint - FIXED: Synchronous Processing
 @app.post("/emergency-save")
-async def emergency_save(request: EmergencySaveRequest, background_tasks: BackgroundTasks):
-    """Conservative emergency save with minimal changes - preserves working CRM functionality"""
+async def emergency_save(request: EmergencySaveRequest):
+    """FIXED: Synchronous emergency save to prevent Cloud Run premature shutdown"""
     
     try:
-        logger.info(f"🚨 CONSERVATIVE EMERGENCY SAVE: Request for session {request.session_id[:8]}, reason: {request.reason}")
+        logger.info(f"🚨 SYNCHRONOUS EMERGENCY SAVE: Request for session {request.session_id[:8]}, reason: {request.reason}")
         
         # Enhanced database status check
         db_status = db_manager.test_connection()
@@ -1581,49 +1583,117 @@ async def emergency_save(request: EmergencySaveRequest, background_tasks: Backgr
                 "timestamp": datetime.now()
             }
 
-        # Queue CRM save in background with session-ending detection
-        logger.info(f"📝 Queuing conservative emergency CRM save with PDF attachment for session {request.session_id[:8]}...")
+        # FIXED: Perform CRM save SYNCHRONOUSLY to prevent Cloud Run shutdown
+        logger.info(f"📝 Performing SYNCHRONOUS emergency CRM save with PDF attachment for session {request.session_id[:8]}...")
         
         # Check if this is a session-ending reason for proper handling
         is_session_ending = is_session_ending_reason(request.reason)
         logger.info(f"📋 Emergency save type: {'SESSION-ENDING' if is_session_ending else 'NON-SESSION-ENDING'} for reason '{request.reason}'")
         
-        background_tasks.add_task(
-            _perform_emergency_crm_save,
-            session,
-            f"Conservative Emergency Save: {request.reason}"
-        )
-        
-        logger.info(f"✅ Conservative emergency save queued successfully for {request.session_id[:8]}")
-        return {
-            "success": True,
-            "message": f"Conservative emergency save with PDF attachment queued successfully ({'session will be closed' if is_session_ending else 'session remains active'})",
-            "session_id": request.session_id,
-            "reason": request.reason,
-            "queued_for_background_processing": True,
-            "session_ending": is_session_ending,
-            "timestamp": datetime.now(),
-            "session_info": {
-                "user_type": session.user_type.value,
-                "message_count": len(session.messages),
-                "daily_questions": session.daily_question_count,
-                "has_zoho_contact_id": bool(session.zoho_contact_id)
-            },
-            "resilience_info": {
-                "socket_errors_recovered": getattr(db_manager, '_consecutive_socket_errors', 0),
-                "db_type": getattr(db_manager, 'db_type', 'unknown'),
-                "auth_method": getattr(db_manager, '_auth_method', 'unknown')
-            },
-            "features": {
-                "pdf_attachment": True,
-                "contact_id_tracking": True,
-                "session_cleanup": True,
-                "immediate_session_ending": is_session_ending
+        # Execute the CRM save synchronously
+        try:
+            logger.info(f"🔄 SYNCHRONOUS CRM save task starting for session {session.session_id[:8]} (Reason: Synchronous Emergency Save: {request.reason})")
+            
+            save_result = zoho_manager.save_chat_transcript_sync(session, f"Synchronous Emergency Save: {request.reason}")
+            
+            if save_result.get("success"):
+                # Update session status and save to database
+                session.timeout_saved_to_crm = True
+                session.last_activity = datetime.now()
+                
+                # For session-ending reasons, immediately set active = 0
+                if is_session_ending:
+                    session.active = False
+                    logger.info(f"🔒 Session {session.session_id[:8]} marked as INACTIVE due to session-ending reason: {request.reason}")
+                
+                # If we got a contact ID, make sure it's saved
+                if save_result.get("contact_id") and not session.zoho_contact_id:
+                    session.zoho_contact_id = save_result["contact_id"]
+                    logger.info(f"🔗 Saved contact ID {save_result['contact_id']} to session {session.session_id[:8]}")
+                
+                db_manager.save_session(session)
+                logger.info(f"✅ SYNCHRONOUS CRM save completed successfully for session {session.session_id[:8]} (PDF: {save_result.get('pdf_attached', False)}, Active: {session.active})")
+                
+                return {
+                    "success": True,
+                    "message": f"Synchronous emergency save with PDF attachment completed successfully ({'session closed' if is_session_ending else 'session remains active'})",
+                    "session_id": request.session_id,
+                    "reason": request.reason,
+                    "processing_type": "synchronous",
+                    "session_ending": is_session_ending,
+                    "timestamp": datetime.now(),
+                    "crm_result": {
+                        "contact_id": save_result.get("contact_id"),
+                        "note_created": save_result.get("note_created", False),
+                        "pdf_attached": save_result.get("pdf_attached", False)
+                    },
+                    "session_info": {
+                        "user_type": session.user_type.value,
+                        "message_count": len(session.messages),
+                        "daily_questions": session.daily_question_count,
+                        "has_zoho_contact_id": bool(session.zoho_contact_id),
+                        "final_active_status": session.active
+                    },
+                    "resilience_info": {
+                        "socket_errors_recovered": getattr(db_manager, '_consecutive_socket_errors', 0),
+                        "db_type": getattr(db_manager, 'db_type', 'unknown'),
+                        "auth_method": getattr(db_manager, '_auth_method', 'unknown')
+                    },
+                    "features": {
+                        "pdf_attachment": True,
+                        "contact_id_tracking": True,
+                        "session_cleanup": True,
+                        "immediate_session_ending": is_session_ending,
+                        "cloud_run_optimized": True
+                    }
+                }
+            else:
+                logger.error(f"❌ SYNCHRONOUS CRM save failed for session {request.session_id[:8]}: {save_result.get('reason', 'unknown')}")
+                
+                # Even if CRM save fails, still end session for session-ending reasons
+                if is_session_ending:
+                    session.active = False
+                    session.last_activity = datetime.now()
+                    db_manager.save_session(session)
+                    logger.info(f"🔒 Session {request.session_id[:8]} marked as INACTIVE despite CRM save failure (session-ending reason: {request.reason})")
+                
+                return {
+                    "success": False,
+                    "message": f"Emergency save failed: {save_result.get('reason', 'unknown error')}",
+                    "session_id": request.session_id,
+                    "reason": "crm_save_failed",
+                    "session_ending": is_session_ending,
+                    "session_closed": is_session_ending,  # Still close session if it's a session-ending reason
+                    "timestamp": datetime.now(),
+                    "error_details": save_result
+                }
+                
+        except Exception as sync_error:
+            logger.critical(f"❌ Critical error in SYNCHRONOUS CRM save for session {request.session_id[:8]}: {sync_error}", exc_info=True)
+            
+            # Even on critical error, still end session for session-ending reasons
+            try:
+                if is_session_ending:
+                    session.active = False
+                    session.last_activity = datetime.now()
+                    db_manager.save_session(session)
+                    logger.info(f"🔒 Session {request.session_id[:8]} marked as INACTIVE after critical error (session-ending reason: {request.reason})")
+            except Exception as fallback_error:
+                logger.critical(f"❌ Failed to end session even after critical error: {fallback_error}")
+            
+            return {
+                "success": False,
+                "message": f"Critical error during emergency save: {str(sync_error)}",
+                "session_id": request.session_id,
+                "reason": "critical_error",
+                "error_type": type(sync_error).__name__,
+                "session_ending": is_session_ending,
+                "session_closed": is_session_ending,  # Still close session if it's a session-ending reason
+                "timestamp": datetime.now()
             }
-        }
             
     except Exception as e:
-        logger.critical(f"❌ Critical error in conservative emergency_save for session {request.session_id[:8]}: {e}", exc_info=True)
+        logger.critical(f"❌ Critical error in synchronous emergency_save for session {request.session_id[:8]}: {e}", exc_info=True)
         return {
             "success": False,
             "message": f"Internal server error during emergency save: {str(e)}",
@@ -1635,13 +1705,13 @@ async def emergency_save(request: EmergencySaveRequest, background_tasks: Backgr
 
 # Legacy endpoint support (for backwards compatibility)
 @app.post("/emergency-save-resilient")
-async def emergency_save_resilient(request: EmergencySaveRequest, background_tasks: BackgroundTasks):
+async def emergency_save_resilient(request: EmergencySaveRequest):
     """Legacy endpoint - redirects to main emergency save"""
     logger.info("🔄 Legacy endpoint called, redirecting to main emergency save")
-    return await emergency_save(request, background_tasks)
+    return await emergency_save(request)
 
 if __name__ == "__main__":
     import uvicorn
-    logger.info("🚀 Starting FiFi Emergency API - Cloud Run Optimized (Cold Start Resilient)...")
-    logger.info("🔑 Features: Preserved Working CRM + FIXED PDF Attachments + Immediate Session Ending + Cold Start Recovery")
+    logger.info("🚀 Starting FiFi Emergency API - FIXED: Synchronous Processing (Cloud Run Compatible)...")
+    logger.info("🔑 Features: Working CRM + PDF Attachments + Session Ending + Cold Start Recovery + SYNCHRONOUS PROCESSING")
     uvicorn.run(app, host="0.0.0.0", port=8000)
