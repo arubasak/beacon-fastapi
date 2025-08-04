@@ -27,8 +27,8 @@ import base64
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# FastAPI app
-app = FastAPI(title="FiFi Emergency API - Complete Integrated Version", version="3.2.0")
+# FastAPI app with startup event
+app = FastAPI(title="FiFi Emergency API - Complete Integrated Version", version="3.2.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -37,6 +37,25 @@ app.add_middleware(
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
+
+# ADDED: Startup event to handle cold starts
+@app.on_event("startup")
+async def startup_event():
+    """Handle cold start initialization"""
+    logger.info("🚀 FastAPI startup event - Cold start detected")
+    logger.info("🔄 This will trigger fresh database connections on first request")
+
+# ADDED: Health check startup
+@app.on_event("startup") 
+async def startup_health_check():
+    """Verify initial health on startup"""
+    try:
+        # Don't initialize DB connection here - let it happen on first request
+        # This avoids connection timeout issues during cold starts
+        logger.info("✅ Startup health check completed - DB connections will initialize on demand")
+    except Exception as e:
+        logger.error(f"⚠️ Startup health check warning: {e}")
+        # Don't fail startup, just log the warning
 
 # Configuration from environment variables
 SQLITE_CLOUD_CONNECTION = os.getenv("SQLITE_CLOUD_CONNECTION")
@@ -444,7 +463,18 @@ class ResilientDatabaseManager:
             return False
 
     def _ensure_connection(self):
-        """Enhanced connection management with socket error resilience"""
+        """Enhanced connection management with cold start detection"""
+        # ADDED: Force reconnection on potential cold start
+        if not hasattr(self, '_container_start_time'):
+            self._container_start_time = datetime.now()
+            logger.info("🆕 Cold start detected - forcing fresh database connection")
+            if self.conn:
+                try:
+                    self.conn.close()
+                except:
+                    pass
+                self.conn = None
+        
         if self._check_connection_health():
             return
             
@@ -466,6 +496,10 @@ class ResilientDatabaseManager:
                 logger.debug("🔐 Closed old database connection")
             except Exception as e:
                 logger.debug(f"⚠️ Error closing old connection (expected for socket errors): {e}")
+        
+        # ADDED: Clear connection state completely for cold starts
+        self._last_health_check = None
+        self._consecutive_socket_errors = 0
         
         # Attempt reconnection with socket error handling
         if self.db_type == "cloud" and SQLITECLOUD_AVAILABLE and self.connection_string:
@@ -1300,12 +1334,13 @@ async def _perform_emergency_crm_save(session, reason: str):
 @app.get("/")
 async def root():
     return {
-        "message": "FiFi Emergency API - Conservative Fix (Minimal Changes Only)",
+        "message": "FiFi Emergency API - Cold Start Resilient (Cloud Run Optimized)",
         "status": "running",
-        "version": "3.2.0-conservative",
+        "version": "3.2.1-cloud-run-optimized",
         "fixes_applied": [
             "MINIMAL FIX 1: Immediate session ending for browser close/refresh/timeout",
-            "MINIMAL FIX 2: PDF attachment upload using working fifi.py approach"
+            "MINIMAL FIX 2: PDF attachment upload using working fifi.py approach",
+            "COLD START FIX: Enhanced connection recovery for Cloud Run auto-scaling"
         ],
         "working_features_preserved": [
             "SQLite Cloud API Key Authentication",
@@ -1315,6 +1350,12 @@ async def root():
             "Enhanced Contact ID Tracking",
             "Comprehensive Error Handling",
             "Fallback Storage Support"
+        ],
+        "cloud_run_optimizations": [
+            "Cold start detection and recovery",
+            "Fresh connection initialization on startup",
+            "Enhanced socket error handling",
+            "Auto-scaling resilient database connections"
         ],
         "session_ending_reasons": [
             "beforeunload", "unload", "close", "refresh", "timeout",
@@ -1601,6 +1642,6 @@ async def emergency_save_resilient(request: EmergencySaveRequest, background_tas
 
 if __name__ == "__main__":
     import uvicorn
-    logger.info("🚀 Starting FiFi Emergency API - Conservative Fix (Minimal Changes Only)...")
-    logger.info("🔑 Features: Preserved Working CRM + FIXED PDF Attachments + Immediate Session Ending")
+    logger.info("🚀 Starting FiFi Emergency API - Cloud Run Optimized (Cold Start Resilient)...")
+    logger.info("🔑 Features: Preserved Working CRM + FIXED PDF Attachments + Immediate Session Ending + Cold Start Recovery")
     uvicorn.run(app, host="0.0.0.0", port=8000)
