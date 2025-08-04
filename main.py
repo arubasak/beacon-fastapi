@@ -717,7 +717,7 @@ class ResilientDatabaseManager:
                 return None
 
     def save_session(self, session: UserSession):
-        """Save session with socket error resilience"""
+        """Save session with socket error resilience and proper UPDATE logic"""
         with self.lock:
             if self.db_type == "memory":
                 self.local_sessions[session.session_id] = copy.deepcopy(session)
@@ -734,9 +734,9 @@ class ResilientDatabaseManager:
                     json_messages = "[]"
                     json_emails_used = "[]"
                 
-                # Use socket-resilient execution
+                # FIXED: Use INSERT OR REPLACE for proper upsert behavior
                 self._execute_with_socket_retry('''
-                    REPLACE INTO sessions (
+                    INSERT OR REPLACE INTO sessions (
                         session_id, user_type, email, full_name, zoho_contact_id, 
                         created_at, last_activity, messages, active, wp_token, 
                         timeout_saved_to_crm, fingerprint_id, fingerprint_method, 
@@ -766,7 +766,7 @@ class ResilientDatabaseManager:
                 ))
                 
                 self.conn.commit()
-                logger.debug(f"✅ Successfully saved session {session.session_id[:8]} to database")
+                logger.debug(f"✅ Successfully saved session {session.session_id[:8]} to database (Zoho Contact ID: {'SET' if session.zoho_contact_id else 'NOT_SET'})")
                 
             except Exception as e:
                 logger.error(f"❌ Failed to save session {session.session_id[:8]} to database: {e}", exc_info=True)
@@ -800,11 +800,24 @@ class ResilientDatabaseManager:
                 }
             
             try:
+                # FIXED: Ensure we have a healthy connection before cleanup
+                self._ensure_connection()
+                
+                if not self.conn:
+                    logger.error("❌ No database connection available for cleanup")
+                    return {
+                        "success": False,
+                        "error": "No database connection available",
+                        "storage_type": self.db_type,
+                        "message": "Cleanup failed due to no database connection"
+                    }
+                
                 # Calculate cutoff time
                 cutoff_time = datetime.now() - timedelta(minutes=expiry_minutes)
                 cutoff_iso = cutoff_time.isoformat()
+                logger.info(f"🕒 Cleanup cutoff time: {cutoff_iso}")
                 
-                # Find expired sessions
+                # Find expired sessions first
                 cursor = self._execute_with_socket_retry("""
                     SELECT session_id, last_activity FROM sessions 
                     WHERE active = 1 AND last_activity < ?
@@ -822,20 +835,41 @@ class ResilientDatabaseManager:
                         "message": "No expired sessions found"
                     }
                 
-                # Mark sessions as inactive
-                self._execute_with_socket_retry("""
+                # Log sessions being cleaned up
+                for session_id, last_activity in expired_sessions:
+                    logger.info(f"🧹 Cleaning up session {session_id[:8]} (last activity: {last_activity})")
+                
+                # FIXED: Use explicit UPDATE with rowcount verification
+                cursor = self._execute_with_socket_retry("""
                     UPDATE sessions SET active = 0 
                     WHERE active = 1 AND last_activity < ?
                 """, (cutoff_iso,))
                 
+                # Get the number of rows actually updated
+                rows_affected = cursor.rowcount if hasattr(cursor, 'rowcount') else len(expired_sessions)
+                logger.info(f"📊 Database reports {rows_affected} rows updated")
+                
+                # Force commit to ensure changes are persisted
                 self.conn.commit()
+                logger.info("💾 Changes committed to database")
+                
+                # Verify the update worked by checking again
+                verification_cursor = self._execute_with_socket_retry("""
+                    SELECT COUNT(*) FROM sessions 
+                    WHERE active = 1 AND last_activity < ?
+                """, (cutoff_iso,))
+                
+                remaining_expired = verification_cursor.fetchone()[0]
+                logger.info(f"🔍 Verification: {remaining_expired} expired sessions still active after cleanup")
                 
                 expired_session_ids = [session[0] for session in expired_sessions]
-                logger.info(f"✅ Successfully marked {len(expired_sessions)} expired sessions as inactive")
+                logger.info(f"✅ Successfully processed {len(expired_sessions)} expired sessions")
                 
                 return {
                     "success": True,
                     "cleaned_up_count": len(expired_sessions),
+                    "rows_affected": rows_affected,
+                    "remaining_expired_after_cleanup": remaining_expired,
                     "storage_type": self.db_type,
                     "expired_session_ids": [sid[:8] + "..." for sid in expired_session_ids],
                     "cutoff_time": cutoff_iso
@@ -1151,7 +1185,7 @@ zoho_manager = ZohoCRMManager(pdf_exporter)
 logger.info("✅ All managers initialized with complete integration.")
 
 # Helper functions
-def is_crm_eligible(session: UserSession) -> bool:
+def is_crm_eligible(session: UserSession, is_emergency_save: bool = False) -> bool:
     """Enhanced eligibility check for CRM saves"""
     try:
         if not session.email or not session.messages:
@@ -1168,19 +1202,24 @@ def is_crm_eligible(session: UserSession) -> bool:
             logger.debug(f"CRM Eligibility for {session.session_id[:8]}: No questions asked ({session.daily_question_count}).")
             return False
         
-        # 15-minute eligibility check
-        start_time = session.created_at
-        if session.last_question_time and session.last_question_time < start_time:
-            start_time = session.last_question_time
-        
-        elapsed_time = datetime.now() - start_time
-        elapsed_minutes = elapsed_time.total_seconds() / 60
-        
-        if elapsed_minutes < 15.0:
-            logger.debug(f"CRM Eligibility for {session.session_id[:8]}: Less than 15 minutes active ({elapsed_minutes:.1f} min).")
-            return False
+        # FIXED: Emergency saves bypass the 15-minute rule
+        if not is_emergency_save:
+            # 15-minute eligibility check (only for timeout saves, NOT emergency saves)
+            start_time = session.created_at
+            if session.last_question_time and session.last_question_time < start_time:
+                start_time = session.last_question_time
             
-        logger.debug(f"CRM Eligibility for {session.session_id[:8]}: All checks passed. UserType={session.user_type.value}, Questions={session.daily_question_count}, Elapsed={elapsed_minutes:.1f}min.")
+            elapsed_time = datetime.now() - start_time
+            elapsed_minutes = elapsed_time.total_seconds() / 60
+            
+            if elapsed_minutes < 15.0:
+                logger.debug(f"CRM Eligibility for {session.session_id[:8]}: Less than 15 minutes active ({elapsed_minutes:.1f} min).")
+                return False
+            
+            logger.debug(f"CRM Eligibility for {session.session_id[:8]}: All checks passed. UserType={session.user_type.value}, Questions={session.daily_question_count}, Elapsed={elapsed_minutes:.1f}min.")
+        else:
+            logger.debug(f"CRM Eligibility for {session.session_id[:8]}: Emergency save - bypassing time requirement. UserType={session.user_type.value}, Questions={session.daily_question_count}.")
+            
         return True
     except Exception as e:
         logger.error(f"❌ Error checking CRM eligibility for session {session.session_id[:8]}: {e}", exc_info=True)
@@ -1415,8 +1454,8 @@ async def emergency_save(request: EmergencySaveRequest, background_tasks: Backgr
         logger.info(f"   - Already Saved to CRM: {session.timeout_saved_to_crm}")
         logger.info(f"   - Zoho Contact ID: {'SET' if session.zoho_contact_id else 'NOT_SET'}")
         
-        # Check CRM eligibility
-        if not is_crm_eligible(session):
+        # FIXED: Check CRM eligibility with emergency save flag
+        if not is_crm_eligible(session, is_emergency_save=True):
             logger.info(f"ℹ️ Session {request.session_id[:8]} not eligible for CRM save")
             return {
                 "success": False,
@@ -1431,7 +1470,8 @@ async def emergency_save(request: EmergencySaveRequest, background_tasks: Backgr
                     "user_type": session.user_type.value,
                     "daily_questions": session.daily_question_count,
                     "is_registered_or_verified": session.user_type in [UserType.REGISTERED_USER, UserType.EMAIL_VERIFIED_GUEST],
-                    "session_age_minutes": (datetime.now() - session.created_at).total_seconds() / 60
+                    "session_age_minutes": (datetime.now() - session.created_at).total_seconds() / 60,
+                    "emergency_save": True
                 }
             }
         
