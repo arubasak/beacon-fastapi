@@ -1288,8 +1288,12 @@ async def _perform_emergency_crm_save(session, reason: str):
         save_result = zoho_manager.save_chat_transcript_sync(session, reason)
         
         if save_result.get("success"):
-            # Update session status and save to database
-            session.timeout_saved_to_crm = True
+            # Only set timeout_saved_to_crm for actual timeouts
+            if any(keyword in reason.lower() for keyword in ['timeout', 'inactivity', 'expired']):
+                session.timeout_saved_to_crm = True
+                logger.info(f"📝 Session {session.session_id[:8]} marked as timeout-saved to CRM")
+            else:
+                logger.info(f"📝 Session {session.session_id[:8]} emergency-saved to CRM (not timeout)")
             session.last_activity = datetime.now()
             
             # For session-ending reasons, immediately set active = 0
