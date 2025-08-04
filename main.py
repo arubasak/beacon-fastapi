@@ -21,13 +21,14 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.colors import lightgrey
+import base64
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # FastAPI app
-app = FastAPI(title="FiFi Emergency API - Complete Integrated Version", version="3.0.0")
+app = FastAPI(title="FiFi Emergency API - Complete Integrated Version", version="3.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -774,7 +775,82 @@ class ResilientDatabaseManager:
                 self.local_sessions[session.session_id] = copy.deepcopy(session)
                 logger.warning(f"⚠️ Saved session {session.session_id[:8]} to memory as fallback due to database error")
 
-# PDF Exporter (unchanged)
+    def cleanup_expired_sessions(self, expiry_minutes: int = 15) -> Dict[str, Any]:
+        """Clean up expired sessions and mark them as inactive"""
+        with self.lock:
+            logger.info(f"🧹 Starting cleanup of sessions expired more than {expiry_minutes} minutes ago...")
+            
+            if self.db_type == "memory":
+                # Clean up in-memory sessions
+                cutoff_time = datetime.now() - timedelta(minutes=expiry_minutes)
+                expired_sessions = []
+                
+                for session_id, session in list(self.local_sessions.items()):
+                    if session.active and session.last_activity < cutoff_time:
+                        session.active = False  # Mark as inactive
+                        expired_sessions.append(session_id)
+                        logger.debug(f"🔄 Marked in-memory session {session_id[:8]} as inactive")
+                
+                logger.info(f"✅ Cleaned up {len(expired_sessions)} expired sessions from memory")
+                return {
+                    "success": True,
+                    "cleaned_up_count": len(expired_sessions),
+                    "storage_type": "memory",
+                    "expired_session_ids": [sid[:8] + "..." for sid in expired_sessions]
+                }
+            
+            try:
+                # Calculate cutoff time
+                cutoff_time = datetime.now() - timedelta(minutes=expiry_minutes)
+                cutoff_iso = cutoff_time.isoformat()
+                
+                # Find expired sessions
+                cursor = self._execute_with_socket_retry("""
+                    SELECT session_id, last_activity FROM sessions 
+                    WHERE active = 1 AND last_activity < ?
+                """, (cutoff_iso,))
+                
+                expired_sessions = cursor.fetchall()
+                logger.info(f"🔍 Found {len(expired_sessions)} expired sessions to clean up")
+                
+                if not expired_sessions:
+                    logger.info("✅ No expired sessions found")
+                    return {
+                        "success": True,
+                        "cleaned_up_count": 0,
+                        "storage_type": self.db_type,
+                        "message": "No expired sessions found"
+                    }
+                
+                # Mark sessions as inactive
+                self._execute_with_socket_retry("""
+                    UPDATE sessions SET active = 0 
+                    WHERE active = 1 AND last_activity < ?
+                """, (cutoff_iso,))
+                
+                self.conn.commit()
+                
+                expired_session_ids = [session[0] for session in expired_sessions]
+                logger.info(f"✅ Successfully marked {len(expired_sessions)} expired sessions as inactive")
+                
+                return {
+                    "success": True,
+                    "cleaned_up_count": len(expired_sessions),
+                    "storage_type": self.db_type,
+                    "expired_session_ids": [sid[:8] + "..." for sid in expired_session_ids],
+                    "cutoff_time": cutoff_iso
+                }
+                
+            except Exception as e:
+                logger.error(f"❌ Failed to cleanup expired sessions: {e}", exc_info=True)
+                return {
+                    "success": False,
+                    "error": str(e),
+                    "storage_type": self.db_type,
+                    "message": "Cleanup failed due to database error"
+                }
+
+# Enhanced PDF Exporter
 class PDFExporter:
     def __init__(self):
         self.styles = getSampleStyleSheet()
@@ -807,7 +883,7 @@ class PDFExporter:
             logger.error(f"❌ PDF generation failed: {e}", exc_info=True)
             return None
 
-# Zoho CRM Manager (unchanged)
+# Enhanced Zoho CRM Manager with PDF Attachments
 class ZohoCRMManager:
     def __init__(self, pdf_exporter: PDFExporter):
         self.pdf_exporter = pdf_exporter
@@ -938,30 +1014,87 @@ class ZohoCRMManager:
             logger.error(f"❌ Error adding note '{note_title}' to Zoho contact {contact_id}: {e}", exc_info=True)
             return False
 
-    def save_chat_transcript_sync(self, session: UserSession, trigger_reason: str) -> bool:
+    def _add_pdf_attachment(self, contact_id: str, pdf_buffer: io.BytesIO, filename: str) -> bool:
+        """Add PDF attachment to Zoho contact"""
+        access_token = self._get_access_token()
+        if not access_token:
+            return False
+
+        logger.info(f"📎 Adding PDF attachment '{filename}' to Zoho contact {contact_id}")
+        try:
+            headers = {'Authorization': f'Zoho-oauthtoken {access_token}'}
+            
+            # Prepare the file for upload
+            pdf_buffer.seek(0)
+            pdf_data = pdf_buffer.read()
+            
+            # Create the attachment data
+            files = {
+                'file': (filename, pdf_data, 'application/pdf')
+            }
+            
+            data = {
+                'Parent_Id': contact_id,
+                'se_module': 'Contacts'
+            }
+            
+            response = requests.post(
+                f"{self.base_url}/Attachments", 
+                headers=headers, 
+                files=files, 
+                data=data, 
+                timeout=30
+            )
+            response.raise_for_status()
+            result = response.json()
+            
+            if 'data' in result and result['data'] and result['data'][0]['code'] == 'SUCCESS':
+                attachment_id = result['data'][0]['details']['id']
+                logger.info(f"✅ Successfully added PDF attachment: {attachment_id}")
+                return True
+            else:
+                logger.error(f"❌ PDF attachment creation failed with response: {result}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"❌ Error adding PDF attachment '{filename}' to contact {contact_id}: {e}", exc_info=True)
+            return False
+
+    def save_chat_transcript_sync(self, session: UserSession, trigger_reason: str) -> Dict[str, Any]:
+        """Enhanced save with PDF attachment and contact ID update"""
         if not ZOHO_ENABLED:
             logger.info("ℹ️ Zoho is not enabled. Skipping Zoho CRM save.")
-            return False
+            return {"success": False, "reason": "zoho_disabled"}
+            
         if not session.email:
             logger.info(f"ℹ️ Session {session.session_id[:8]} has no email. Skipping Zoho CRM save.")
-            return False
+            return {"success": False, "reason": "no_email"}
+            
         if not session.messages:
             logger.info(f"ℹ️ Session {session.session_id[:8]} has no messages. Skipping Zoho CRM save.")
-            return False
+            return {"success": False, "reason": "no_messages"}
         
         try:
-            logger.info(f"🔄 Starting Zoho CRM save for session {session.session_id[:8]} (Reason: {trigger_reason})")
+            logger.info(f"🔄 Starting enhanced Zoho CRM save for session {session.session_id[:8]} (Reason: {trigger_reason})")
             
+            # Find or create contact
             contact_id = self._find_contact_by_email(session.email)
             if not contact_id:
                 contact_id = self._create_contact(session.email, session.full_name)
             if not contact_id:
                 logger.error(f"❌ Failed to find or create Zoho contact for {session.email}. Aborting CRM save.")
-                return False
+                return {"success": False, "reason": "contact_creation_failed"}
+
+            # **FIX 1: Update session with contact ID and save to database**
+            if not session.zoho_contact_id:
+                session.zoho_contact_id = contact_id
+                logger.info(f"🔗 Updated session {session.session_id[:8]} with Zoho contact ID: {contact_id}")
+                # Note: The session will be saved to database in the calling function
 
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             note_title = f"FiFi AI Emergency Save - {timestamp} ({trigger_reason})"
             
+            # Create note content
             note_content = f"**Emergency Save Information:**\n"
             note_content += f"- Session ID: {session.session_id}\n"
             note_content += f"- User: {session.full_name or 'Unknown'} ({session.email})\n"
@@ -970,28 +1103,45 @@ class ZohoCRMManager:
             note_content += f"- Timestamp: {timestamp}\n"
             note_content += f"- Total Messages: {len(session.messages)}\n"
             note_content += f"- Questions Asked (Daily Count): {session.daily_question_count}\n\n"
-            note_content += "**Conversation Transcript (truncated if too long):**\n"
+            note_content += "**Conversation Transcript (see PDF attachment for full details):**\n"
             
             for i, msg in enumerate(session.messages):
                 role = msg.get("role", "Unknown").capitalize()
                 content = re.sub(r'<[^>]+>', '', msg.get("content", ""))
                 
-                if len(content) > 500:
-                    content = content[:500] + "..."
+                if len(content) > 200:  # Shorter preview since we have PDF
+                    content = content[:200] + "..."
                     
                 note_content += f"\n{i+1}. **{role}:** {content}\n"
                 
+            # Add the note
             note_success = self._add_note(contact_id, note_title, note_content)
+            
+            # **FIX 2: Generate and attach PDF**
+            pdf_success = False
+            pdf_buffer = self.pdf_exporter.generate_chat_pdf(session)
+            if pdf_buffer:
+                pdf_filename = f"FiFi_Chat_Transcript_{session.session_id[:8]}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+                pdf_success = self._add_pdf_attachment(contact_id, pdf_buffer, pdf_filename)
+                pdf_buffer.close()
+            else:
+                logger.warning(f"⚠️ Failed to generate PDF for session {session.session_id[:8]}")
+                
             if note_success:
-                logger.info(f"✅ Zoho CRM save successful for session {session.session_id[:8]}")
-                return True
+                logger.info(f"✅ Zoho CRM save successful for session {session.session_id[:8]} (Note: {note_success}, PDF: {pdf_success})")
+                return {
+                    "success": True, 
+                    "contact_id": contact_id,
+                    "note_created": note_success,
+                    "pdf_attached": pdf_success
+                }
             else:
                 logger.error(f"❌ Zoho note creation failed for session {session.session_id[:8]}.")
-                return False
+                return {"success": False, "reason": "note_creation_failed"}
                 
         except Exception as e:
             logger.error(f"❌ Emergency CRM save process failed for session {session.session_id[:8]}: {e}", exc_info=True)
-            return False
+            return {"success": False, "reason": "exception", "error": str(e)}
 
 # Initialize managers
 logger.info("🚀 Initializing complete integrated managers...")
@@ -1037,20 +1187,26 @@ def is_crm_eligible(session: UserSession) -> bool:
         return False
 
 async def _perform_emergency_crm_save(session, reason: str):
-    """Enhanced background task to perform CRM save and update session status"""
+    """Enhanced background task with contact ID saving"""
     try:
         logger.info(f"🔄 Background CRM save task starting for session {session.session_id[:8]} (Reason: {reason})")
         
-        save_success = zoho_manager.save_chat_transcript_sync(session, reason)
+        save_result = zoho_manager.save_chat_transcript_sync(session, reason)
         
-        if save_success:
-            # Update session to reflect the save
+        if save_result.get("success"):
+            # **FIX 3: Update session status and save to database**
             session.timeout_saved_to_crm = True
             session.last_activity = datetime.now()
+            
+            # If we got a contact ID, make sure it's saved
+            if save_result.get("contact_id") and not session.zoho_contact_id:
+                session.zoho_contact_id = save_result["contact_id"]
+                logger.info(f"🔗 Saved contact ID {save_result['contact_id']} to session {session.session_id[:8]}")
+            
             db_manager.save_session(session)
-            logger.info(f"✅ Background CRM save completed successfully for session {session.session_id[:8]}")
+            logger.info(f"✅ Background CRM save completed successfully for session {session.session_id[:8]} (PDF: {save_result.get('pdf_attached', False)})")
         else:
-            logger.error(f"❌ Background CRM save failed for session {session.session_id[:8]}")
+            logger.error(f"❌ Background CRM save failed for session {session.session_id[:8]}: {save_result.get('reason', 'unknown')}")
             
     except Exception as e:
         logger.critical(f"❌ Critical error in background CRM save task for session {session.session_id[:8]}: {e}", exc_info=True)
@@ -1059,13 +1215,16 @@ async def _perform_emergency_crm_save(session, reason: str):
 @app.get("/")
 async def root():
     return {
-        "message": "FiFi Emergency API - Complete Integrated Version",
+        "message": "FiFi Emergency API - Complete Integrated Version with PDF Attachments",
         "status": "running",
-        "version": "3.0.0-integrated",
+        "version": "3.1.0-integrated",
         "features": [
             "SQLite Cloud API Key Authentication",
             "Socket Error Resilience", 
             "Automatic Connection Recovery",
+            "PDF Attachment Generation",
+            "Session Cleanup Endpoint",
+            "Enhanced Contact ID Tracking",
             "Comprehensive Error Handling",
             "Fallback Storage Support",
             "Enhanced Diagnostics"
@@ -1087,7 +1246,9 @@ async def health_check():
                 "api_key_auth": True,
                 "socket_resilience": True,
                 "auto_reconnect": True,
-                "fallback_storage": True
+                "fallback_storage": True,
+                "pdf_attachments": True,
+                "session_cleanup": True
             }
         }
     except Exception as e:
@@ -1106,7 +1267,7 @@ async def comprehensive_diagnostics():
     try:
         diagnostics = {
             "timestamp": datetime.now(),
-            "version": "3.0.0-integrated",
+            "version": "3.1.0-integrated",
             "environment": {
                 "SQLITE_CLOUD_CONNECTION": "SET" if SQLITE_CLOUD_CONNECTION else "MISSING",
                 "ZOHO_ENABLED": ZOHO_ENABLED,
@@ -1166,10 +1327,40 @@ async def comprehensive_diagnostics():
             "status": "diagnostics_failed"
         }
 
+# **FIX 4: Add the missing cleanup endpoint**
+@app.post("/cleanup-expired-sessions")
+async def cleanup_expired_sessions():
+    """Clean up expired sessions - called by Google Cloud Scheduler"""
+    try:
+        logger.info("🧹 Cleanup endpoint called by scheduler")
+        
+        # Clean up sessions that have been inactive for more than 15 minutes
+        cleanup_result = db_manager.cleanup_expired_sessions(expiry_minutes=15)
+        
+        if cleanup_result["success"]:
+            logger.info(f"✅ Cleanup completed: {cleanup_result['cleaned_up_count']} sessions marked as inactive")
+        else:
+            logger.error(f"❌ Cleanup failed: {cleanup_result.get('message', 'Unknown error')}")
+        
+        return {
+            "success": cleanup_result["success"],
+            "timestamp": datetime.now(),
+            "result": cleanup_result
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Cleanup endpoint failed: {e}", exc_info=True)
+        return {
+            "success": False,
+            "timestamp": datetime.now(),
+            "error": str(e),
+            "error_type": type(e).__name__
+        }
+
 # Main Emergency Save Endpoint - Complete Integrated Version
 @app.post("/emergency-save")
 async def emergency_save(request: EmergencySaveRequest, background_tasks: BackgroundTasks):
-    """Complete integrated emergency save with all resilience features"""
+    """Complete integrated emergency save with all resilience features and fixes"""
     
     try:
         logger.info(f"🚨 INTEGRATED EMERGENCY SAVE: Request for session {request.session_id[:8]}, reason: {request.reason}")
@@ -1222,6 +1413,7 @@ async def emergency_save(request: EmergencySaveRequest, background_tasks: Backgr
         logger.info(f"   - Messages: {len(session.messages)}")
         logger.info(f"   - Daily Questions: {session.daily_question_count}")
         logger.info(f"   - Already Saved to CRM: {session.timeout_saved_to_crm}")
+        logger.info(f"   - Zoho Contact ID: {'SET' if session.zoho_contact_id else 'NOT_SET'}")
         
         # Check CRM eligibility
         if not is_crm_eligible(session):
@@ -1255,7 +1447,7 @@ async def emergency_save(request: EmergencySaveRequest, background_tasks: Backgr
             }
 
         # Queue CRM save in background
-        logger.info(f"📝 Queuing integrated emergency CRM save for session {request.session_id[:8]}...")
+        logger.info(f"📝 Queuing integrated emergency CRM save with PDF attachment for session {request.session_id[:8]}...")
         background_tasks.add_task(
             _perform_emergency_crm_save,
             session,
@@ -1265,7 +1457,7 @@ async def emergency_save(request: EmergencySaveRequest, background_tasks: Backgr
         logger.info(f"✅ Integrated emergency save queued successfully for {request.session_id[:8]}")
         return {
             "success": True,
-            "message": "Integrated emergency save queued successfully",
+            "message": "Integrated emergency save with PDF attachment queued successfully",
             "session_id": request.session_id,
             "reason": request.reason,
             "queued_for_background_processing": True,
@@ -1273,12 +1465,18 @@ async def emergency_save(request: EmergencySaveRequest, background_tasks: Backgr
             "session_info": {
                 "user_type": session.user_type.value,
                 "message_count": len(session.messages),
-                "daily_questions": session.daily_question_count
+                "daily_questions": session.daily_question_count,
+                "has_zoho_contact_id": bool(session.zoho_contact_id)
             },
             "resilience_info": {
                 "socket_errors_recovered": getattr(db_manager, '_consecutive_socket_errors', 0),
                 "db_type": getattr(db_manager, 'db_type', 'unknown'),
                 "auth_method": getattr(db_manager, '_auth_method', 'unknown')
+            },
+            "features": {
+                "pdf_attachment": True,
+                "contact_id_tracking": True,
+                "session_cleanup": True
             }
         }
             
@@ -1302,6 +1500,6 @@ async def emergency_save_resilient(request: EmergencySaveRequest, background_tas
 
 if __name__ == "__main__":
     import uvicorn
-    logger.info("🚀 Starting FiFi Emergency API - Complete Integrated Version...")
-    logger.info("🔑 Features: API Key Auth + Socket Resilience + Auto Recovery + Enhanced Diagnostics")
+    logger.info("🚀 Starting FiFi Emergency API - Complete Integrated Version with PDF Attachments...")
+    logger.info("🔑 Features: API Key Auth + Socket Resilience + Auto Recovery + PDF Attachments + Session Cleanup + Enhanced Diagnostics")
     uvicorn.run(app, host="0.0.0.0", port=8000)
