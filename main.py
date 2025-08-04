@@ -925,12 +925,13 @@ class ZohoCRMManager:
         self._access_token = None
         self._token_expiry = None
 
-    def _get_access_token(self) -> Optional[str]:
+    def _get_access_token(self, force_refresh: bool = False) -> Optional[str]:
         if not ZOHO_ENABLED:
             logger.debug("Zoho is not enabled. Skipping access token request.")
             return None
 
-        if self._access_token and self._token_expiry and datetime.now() < self._token_expiry:
+        # FIXED: Add force_refresh support for PDF attachment retry logic
+        if not force_refresh and self._access_token and self._token_expiry and datetime.now() < self._token_expiry:
             logger.debug("Using cached Zoho access token.")
             return self._access_token
         
@@ -1049,50 +1050,57 @@ class ZohoCRMManager:
             return False
 
     def _add_pdf_attachment(self, contact_id: str, pdf_buffer: io.BytesIO, filename: str) -> bool:
-        """Add PDF attachment to Zoho contact"""
+        """Add PDF attachment to Zoho contact - FIXED VERSION using working fifi.py approach"""
         access_token = self._get_access_token()
         if not access_token:
             return False
 
         logger.info(f"📎 Adding PDF attachment '{filename}' to Zoho contact {contact_id}")
-        try:
-            headers = {'Authorization': f'Zoho-oauthtoken {access_token}'}
-            
-            # Prepare the file for upload
-            pdf_buffer.seek(0)
-            pdf_data = pdf_buffer.read()
-            
-            # Create the attachment data
-            files = {
-                'file': (filename, pdf_data, 'application/pdf')
-            }
-            
-            data = {
-                'Parent_Id': contact_id,
-                'se_module': 'Contacts'
-            }
-            
-            response = requests.post(
-                f"{self.base_url}/Attachments", 
-                headers=headers, 
-                files=files, 
-                data=data, 
-                timeout=30
-            )
-            response.raise_for_status()
-            result = response.json()
-            
-            if 'data' in result and result['data'] and result['data'][0]['code'] == 'SUCCESS':
-                attachment_id = result['data'][0]['details']['id']
-                logger.info(f"✅ Successfully added PDF attachment: {attachment_id}")
-                return True
-            else:
-                logger.error(f"❌ PDF attachment creation failed with response: {result}")
-                return False
+        
+        # FIXED: Use the working URL pattern from fifi.py
+        upload_url = f"{self.base_url}/Contacts/{contact_id}/Attachments"
+        
+        max_retries = 2
+        for attempt in range(max_retries):
+            try:
+                headers = {'Authorization': f'Zoho-oauthtoken {access_token}'}
                 
-        except Exception as e:
-            logger.error(f"❌ Error adding PDF attachment '{filename}' to contact {contact_id}: {e}", exc_info=True)
-            return False
+                # FIXED: Use the exact working approach from fifi.py
+                pdf_buffer.seek(0)
+                response = requests.post(
+                    upload_url, 
+                    headers=headers, 
+                    files={'file': (filename, pdf_buffer.read(), 'application/pdf')},
+                    timeout=60  # Increased timeout like fifi.py
+                )
+                
+                # FIXED: Handle token refresh like fifi.py
+                if response.status_code == 401:
+                    logger.warning("Zoho token expired during upload, attempting refresh...")
+                    access_token = self._get_access_token(force_refresh=True)
+                    if not access_token: 
+                        return False
+                    headers['Authorization'] = f'Zoho-oauthtoken {access_token}'
+                    continue
+                
+                response.raise_for_status()
+                data = response.json()
+                
+                if 'data' in data and data['data'] and data['data'][0]['code'] == 'SUCCESS':
+                    logger.info(f"✅ Successfully added PDF attachment: {filename}")
+                    return True
+                else:
+                    logger.error(f"❌ PDF attachment creation failed with response: {data}")
+                    
+            except requests.exceptions.Timeout:
+                logger.error(f"⏰ Zoho upload timeout (attempt {attempt + 1}/{max_retries})")
+            except Exception as e:
+                logger.error(f"❌ Error adding PDF attachment (attempt {attempt + 1}/{max_retries}): {e}", exc_info=True)
+                
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)
+                
+        return False
 
     def save_chat_transcript_sync(self, session: UserSession, trigger_reason: str) -> Dict[str, Any]:
         """Enhanced save with PDF attachment and contact ID update"""
@@ -1185,6 +1193,18 @@ zoho_manager = ZohoCRMManager(pdf_exporter)
 logger.info("✅ All managers initialized with complete integration.")
 
 # Helper functions
+def _is_session_ending_reason(self, reason: str) -> bool:
+    """Determines if an emergency save reason should end the session immediately"""
+    session_ending_keywords = [
+        'beforeunload', 'unload', 'close', 'refresh', 'timeout', 
+        'parent_beforeunload', 'browser_close', 'tab_close', 
+        'window_close', 'page_refresh', 'browser_refresh',
+        'session_timeout', 'inactivity'
+    ]
+    
+    reason_lower = reason.lower()
+    return any(keyword in reason_lower for keyword in session_ending_keywords)
+
 def is_crm_eligible(session: UserSession, is_emergency_save: bool = False) -> bool:
     """Enhanced eligibility check for CRM saves"""
     try:
@@ -1226,16 +1246,25 @@ def is_crm_eligible(session: UserSession, is_emergency_save: bool = False) -> bo
         return False
 
 async def _perform_emergency_crm_save(session, reason: str):
-    """Enhanced background task with contact ID saving"""
+    """Enhanced background task with session-ending logic and contact ID saving"""
     try:
         logger.info(f"🔄 Background CRM save task starting for session {session.session_id[:8]} (Reason: {reason})")
+        
+        # FIXED: Check if this is a session-ending reason
+        is_session_ending = _is_session_ending_reason(reason)
+        logger.info(f"📋 Session ending check: {is_session_ending} for reason '{reason}'")
         
         save_result = zoho_manager.save_chat_transcript_sync(session, reason)
         
         if save_result.get("success"):
-            # **FIX 3: Update session status and save to database**
+            # Update session status and save to database
             session.timeout_saved_to_crm = True
             session.last_activity = datetime.now()
+            
+            # FIXED: For session-ending reasons, immediately set active = 0
+            if is_session_ending:
+                session.active = False
+                logger.info(f"🔒 Session {session.session_id[:8]} marked as INACTIVE due to session-ending reason: {reason}")
             
             # If we got a contact ID, make sure it's saved
             if save_result.get("contact_id") and not session.zoho_contact_id:
@@ -1243,30 +1272,55 @@ async def _perform_emergency_crm_save(session, reason: str):
                 logger.info(f"🔗 Saved contact ID {save_result['contact_id']} to session {session.session_id[:8]}")
             
             db_manager.save_session(session)
-            logger.info(f"✅ Background CRM save completed successfully for session {session.session_id[:8]} (PDF: {save_result.get('pdf_attached', False)})")
+            logger.info(f"✅ Background CRM save completed successfully for session {session.session_id[:8]} (PDF: {save_result.get('pdf_attached', False)}, Active: {session.active})")
         else:
             logger.error(f"❌ Background CRM save failed for session {session.session_id[:8]}: {save_result.get('reason', 'unknown')}")
             
+            # FIXED: Even if CRM save fails, still end session for session-ending reasons
+            if is_session_ending:
+                session.active = False
+                session.last_activity = datetime.now()
+                db_manager.save_session(session)
+                logger.info(f"🔒 Session {session.session_id[:8]} marked as INACTIVE despite CRM save failure (session-ending reason: {reason})")
+            
     except Exception as e:
         logger.critical(f"❌ Critical error in background CRM save task for session {session.session_id[:8]}: {e}", exc_info=True)
+        
+        # FIXED: Even on critical error, still end session for session-ending reasons
+        try:
+            is_session_ending = _is_session_ending_reason(reason)
+            if is_session_ending:
+                session.active = False
+                session.last_activity = datetime.now()
+                db_manager.save_session(session)
+                logger.info(f"🔒 Session {session.session_id[:8]} marked as INACTIVE after critical error (session-ending reason: {reason})")
+        except Exception as fallback_error:
+            logger.critical(f"❌ Failed to end session even after critical error: {fallback_error}")
 
 # API Endpoints
 @app.get("/")
 async def root():
     return {
-        "message": "FiFi Emergency API - Complete Integrated Version with PDF Attachments",
+        "message": "FiFi Emergency API - Complete Integrated Version with Session-Ending Logic",
         "status": "running",
-        "version": "3.1.0-integrated",
+        "version": "3.2.0-integrated",
         "features": [
             "SQLite Cloud API Key Authentication",
             "Socket Error Resilience", 
             "Automatic Connection Recovery",
-            "PDF Attachment Generation",
+            "FIXED: PDF Attachment Generation (using fifi.py working approach)",
+            "FIXED: Immediate Session Ending for browser close/refresh/timeout",
             "Session Cleanup Endpoint",
             "Enhanced Contact ID Tracking",
             "Comprehensive Error Handling",
             "Fallback Storage Support",
             "Enhanced Diagnostics"
+        ],
+        "session_ending_reasons": [
+            "beforeunload", "unload", "close", "refresh", "timeout",
+            "parent_beforeunload", "browser_close", "tab_close",
+            "window_close", "page_refresh", "browser_refresh",
+            "session_timeout", "inactivity"
         ],
         "timestamp": datetime.now()
     }
@@ -1287,7 +1341,8 @@ async def health_check():
                 "auto_reconnect": True,
                 "fallback_storage": True,
                 "pdf_attachments": True,
-                "session_cleanup": True
+                "session_cleanup": True,
+                "immediate_session_ending": True
             }
         }
     except Exception as e:
@@ -1306,7 +1361,7 @@ async def comprehensive_diagnostics():
     try:
         diagnostics = {
             "timestamp": datetime.now(),
-            "version": "3.1.0-integrated",
+            "version": "3.2.0-integrated",
             "environment": {
                 "SQLITE_CLOUD_CONNECTION": "SET" if SQLITE_CLOUD_CONNECTION else "MISSING",
                 "ZOHO_ENABLED": ZOHO_ENABLED,
@@ -1488,6 +1543,11 @@ async def emergency_save(request: EmergencySaveRequest, background_tasks: Backgr
 
         # Queue CRM save in background
         logger.info(f"📝 Queuing integrated emergency CRM save with PDF attachment for session {request.session_id[:8]}...")
+        
+        # FIXED: Check if this is a session-ending reason for proper handling
+        is_session_ending = _is_session_ending_reason(request.reason)
+        logger.info(f"📋 Emergency save type: {'SESSION-ENDING' if is_session_ending else 'NON-SESSION-ENDING'} for reason '{request.reason}'")
+        
         background_tasks.add_task(
             _perform_emergency_crm_save,
             session,
@@ -1497,10 +1557,11 @@ async def emergency_save(request: EmergencySaveRequest, background_tasks: Backgr
         logger.info(f"✅ Integrated emergency save queued successfully for {request.session_id[:8]}")
         return {
             "success": True,
-            "message": "Integrated emergency save with PDF attachment queued successfully",
+            "message": f"Integrated emergency save with PDF attachment queued successfully ({'session will be closed' if is_session_ending else 'session remains active'})",
             "session_id": request.session_id,
             "reason": request.reason,
             "queued_for_background_processing": True,
+            "session_ending": is_session_ending,
             "timestamp": datetime.now(),
             "session_info": {
                 "user_type": session.user_type.value,
@@ -1516,7 +1577,8 @@ async def emergency_save(request: EmergencySaveRequest, background_tasks: Backgr
             "features": {
                 "pdf_attachment": True,
                 "contact_id_tracking": True,
-                "session_cleanup": True
+                "session_cleanup": True,
+                "immediate_session_ending": is_session_ending
             }
         }
             
@@ -1540,6 +1602,6 @@ async def emergency_save_resilient(request: EmergencySaveRequest, background_tas
 
 if __name__ == "__main__":
     import uvicorn
-    logger.info("🚀 Starting FiFi Emergency API - Complete Integrated Version with PDF Attachments...")
-    logger.info("🔑 Features: API Key Auth + Socket Resilience + Auto Recovery + PDF Attachments + Session Cleanup + Enhanced Diagnostics")
+    logger.info("🚀 Starting FiFi Emergency API - Complete Integrated Version with Session-Ending Logic...")
+    logger.info("🔑 Features: API Key Auth + Socket Resilience + Auto Recovery + FIXED PDF Attachments + Immediate Session Ending + Enhanced Diagnostics")
     uvicorn.run(app, host="0.0.0.0", port=8000)
