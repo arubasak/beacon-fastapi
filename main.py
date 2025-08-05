@@ -38,6 +38,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.options("/emergency-save")
+async def emergency_save_options():
+    """Fast OPTIONS handler to prevent 504 timeouts"""
+    return {"status": "ok"}
+
 # FIXED: Lightweight startup events - no heavy operations
 @app.on_event("startup")
 async def startup_event():
