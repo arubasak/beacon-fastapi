@@ -1489,31 +1489,6 @@ async def cleanup_expired_sessions(background_tasks: BackgroundTasks):
             "timestamp": datetime.now()
         }
 
-@app.post("/cleanup-expired-sessions")
-async def cleanup_expired_sessions(background_tasks: BackgroundTasks):
-    """FIXED: Ultra-fast cleanup - works like emergency-save"""
-    try:
-        logger.info("🧹 FAST CLEANUP: Starting ultra-fast cleanup")
-        
-        # MINIMAL work before response - just queue background task
-        background_tasks.add_task(_perform_full_cleanup_in_background)
-        
-        # IMMEDIATE response - don't wait for anything
-        return {
-            "success": True,
-            "message": "Cleanup queued for background processing",
-            "queued_for_background_processing": True,
-            "timestamp": datetime.now()
-        }
-        
-    except Exception as e:
-        logger.error(f"❌ Cleanup endpoint error: {e}")
-        return {
-            "success": False,
-            "message": "Cleanup queued for retry",
-            "timestamp": datetime.now()
-        }
-
 async def _perform_full_cleanup_in_background():
     """Background task - does ALL the heavy work after response sent"""
     try:
