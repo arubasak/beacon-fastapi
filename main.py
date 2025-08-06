@@ -1466,40 +1466,82 @@ async def comprehensive_diagnostics():
 
 @app.post("/cleanup-expired-sessions")
 async def cleanup_expired_sessions(background_tasks: BackgroundTasks):
-    """Enhanced cleanup with CRM save - called by Google Cloud Scheduler"""
+    """FIXED: Ultra-fast cleanup - works like emergency-save"""
     try:
-        logger.info("🧹 ENHANCED CLEANUP: Starting cleanup with CRM save for expired sessions")
+        logger.info("🧹 FAST CLEANUP: Starting ultra-fast cleanup")
         
-        # Quick database health check
+        # MINIMAL work before response - just queue background task
+        background_tasks.add_task(_perform_full_cleanup_in_background)
+        
+        # IMMEDIATE response - don't wait for anything
+        return {
+            "success": True,
+            "message": "Cleanup queued for background processing",
+            "queued_for_background_processing": True,
+            "timestamp": datetime.now()
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Cleanup endpoint error: {e}")
+        return {
+            "success": False,
+            "message": "Cleanup queued for retry",
+            "timestamp": datetime.now()
+        }
+
+@app.post("/cleanup-expired-sessions")
+async def cleanup_expired_sessions(background_tasks: BackgroundTasks):
+    """FIXED: Ultra-fast cleanup - works like emergency-save"""
+    try:
+        logger.info("🧹 FAST CLEANUP: Starting ultra-fast cleanup")
+        
+        # MINIMAL work before response - just queue background task
+        background_tasks.add_task(_perform_full_cleanup_in_background)
+        
+        # IMMEDIATE response - don't wait for anything
+        return {
+            "success": True,
+            "message": "Cleanup queued for background processing",
+            "queued_for_background_processing": True,
+            "timestamp": datetime.now()
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Cleanup endpoint error: {e}")
+        return {
+            "success": False,
+            "message": "Cleanup queued for retry",
+            "timestamp": datetime.now()
+        }
+
+async def _perform_full_cleanup_in_background():
+    """Background task - does ALL the heavy work after response sent"""
+    try:
+        logger.info("🔄 Background FULL CLEANUP task starting...")
+        
+        # Database health check
         db_status = db_manager.test_connection()
-        logger.info(f"📊 Database status: {db_status.get('status', 'unknown')}")
+        logger.info(f"📊 Background cleanup - Database status: {db_status.get('status', 'unknown')}")
         
         if db_status["status"] not in ["healthy", "connection_ok_functionality_failed"]:
-            logger.error(f"❌ Database not healthy for cleanup: {db_status}")
-            return {
-                "success": False,
-                "message": f"Database connection issue: {db_status.get('message', 'Unknown error')}",
-                "reason": "database_unhealthy",
-                "timestamp": datetime.now()
-            }
+            logger.error(f"❌ Background cleanup - Database not healthy: {db_status}")
+            return
         
-        # Find expired sessions (15+ minutes inactive)
-        logger.info("🔍 Finding sessions expired more than 15 minutes...")
+        # Find expired sessions (all the heavy work now happens in background)
         expired_sessions = []
         
         if db_manager.db_type == "memory":
-            # Handle in-memory sessions
             cutoff_time = datetime.now() - timedelta(minutes=15)
             for session_id, session in list(db_manager.local_sessions.items()):
                 if session.active and session.last_activity < cutoff_time:
                     expired_sessions.append(session)
         else:
-            # Handle database sessions
             try:
                 cutoff_time = datetime.now() - timedelta(minutes=15)
                 cutoff_iso = cutoff_time.isoformat()
+                logger.info(f"🕒 Background cleanup cutoff time: {cutoff_iso}")
                 
-                # Find expired active sessions
+                # Find expired active sessions that haven't been saved to CRM
                 cursor = db_manager._execute_with_socket_retry("""
                     SELECT session_id, user_type, email, full_name, zoho_contact_id, 
                            created_at, last_activity, messages, active, wp_token, 
@@ -1515,11 +1557,11 @@ async def cleanup_expired_sessions(background_tasks: BackgroundTasks):
                 """, (cutoff_iso,))
                 
                 rows = cursor.fetchall()
-                logger.info(f"🔍 Found {len(rows)} expired sessions to process")
+                logger.info(f"🔍 Background cleanup found {len(rows)} expired sessions to process")
                 
                 # Convert rows to UserSession objects
                 for row in rows:
-                    if len(row) >= 31:  # Ensure we have all columns
+                    if len(row) >= 31:
                         try:
                             user_session = UserSession(
                                 session_id=row[0],
@@ -1556,82 +1598,58 @@ async def cleanup_expired_sessions(background_tasks: BackgroundTasks):
                             )
                             expired_sessions.append(user_session)
                         except Exception as e:
-                            logger.error(f"❌ Failed to create UserSession from row: {e}")
+                            logger.error(f"❌ Background cleanup failed to create UserSession from row: {e}")
                             
             except Exception as e:
-                logger.error(f"❌ Failed to query expired sessions: {e}")
-                return {
-                    "success": False,
-                    "message": f"Failed to query expired sessions: {str(e)}",
-                    "reason": "query_failed",
-                    "timestamp": datetime.now()
-                }
+                logger.error(f"❌ Background cleanup failed to query expired sessions: {e}")
+                return
         
         if not expired_sessions:
-            logger.info("✅ No expired sessions found")
-            return {
-                "success": True,
-                "message": "No expired sessions found",
-                "expired_count": 0,
-                "crm_eligible_count": 0,
-                "timestamp": datetime.now()
-            }
+            logger.info("✅ Background cleanup - No expired sessions found")
+            return
         
-        # Check CRM eligibility for each expired session
-        crm_eligible_sessions = []
+        # Process each expired session
+        crm_saved_count = 0
         for session in expired_sessions:
-            logger.info(f"🔍 Checking session {session.session_id[:8]} - Email: {'SET' if session.email else 'NOT_SET'}, Type: {session.user_type.value}, Questions: {session.daily_question_count}")
+            logger.info(f"🔍 Background cleanup processing session {session.session_id[:8]} - Email: {'SET' if session.email else 'NOT_SET'}, Type: {session.user_type.value}, Questions: {session.daily_question_count}")
             
-            if is_crm_eligible(session, is_emergency_save=False):  # Use timeout rules (15-minute requirement)
-                crm_eligible_sessions.append(session)
-                logger.info(f"✅ Session {session.session_id[:8]} is CRM eligible")
+            if is_crm_eligible(session, is_emergency_save=False):  # Use timeout rules
+                logger.info(f"📝 Background cleanup - Starting CRM save for session {session.session_id[:8]}")
+                
+                # Save to CRM (same as emergency save)
+                save_result = zoho_manager.save_chat_transcript_sync(session, "Automated Session Timeout Cleanup")
+                
+                if save_result.get("success"):
+                    session.timeout_saved_to_crm = True  # Accurate for timeouts
+                    session.active = False
+                    session.last_activity = datetime.now()
+                    
+                    if save_result.get("contact_id") and not session.zoho_contact_id:
+                        session.zoho_contact_id = save_result["contact_id"]
+                        logger.info(f"🔗 Background cleanup - Saved contact ID {save_result['contact_id']} to session {session.session_id[:8]}")
+                    
+                    db_manager.save_session(session)
+                    crm_saved_count += 1
+                    logger.info(f"✅ Background cleanup CRM save completed for session {session.session_id[:8]} (PDF: {save_result.get('pdf_attached', False)})")
+                else:
+                    logger.error(f"❌ Background cleanup CRM save failed for session {session.session_id[:8]}: {save_result.get('reason', 'unknown')}")
+                    
+                    # Still mark as inactive
+                    session.active = False
+                    session.last_activity = datetime.now()
+                    db_manager.save_session(session)
+                    logger.info(f"🔒 Background cleanup - Session {session.session_id[:8]} marked as INACTIVE despite CRM save failure")
             else:
-                # Still mark as inactive even if not CRM eligible
+                # Not CRM eligible but still mark as inactive
                 session.active = False
                 session.last_activity = datetime.now()
                 db_manager.save_session(session)
-                logger.info(f"ℹ️ Session {session.session_id[:8]} not CRM eligible but marked inactive")
+                logger.info(f"ℹ️ Background cleanup - Session {session.session_id[:8]} not CRM eligible but marked inactive")
         
-        logger.info(f"📊 Cleanup summary: {len(expired_sessions)} expired, {len(crm_eligible_sessions)} CRM eligible")
-        
-        # Queue background CRM saves for eligible sessions
-        for session in crm_eligible_sessions:
-            logger.info(f"📝 Queuing CRM save for expired session {session.session_id[:8]}")
-            background_tasks.add_task(
-                _perform_cleanup_crm_save,
-                session,
-                "Automated Session Timeout Cleanup"
-            )
-        
-        logger.info(f"✅ Cleanup queued successfully: {len(crm_eligible_sessions)} sessions queued for CRM save")
-        
-        return {
-            "success": True,
-            "message": f"Cleanup completed: {len(expired_sessions)} expired sessions processed, {len(crm_eligible_sessions)} queued for CRM save",
-            "expired_count": len(expired_sessions),
-            "crm_eligible_count": len(crm_eligible_sessions),
-            "queued_for_background_processing": True,
-            "timestamp": datetime.now(),
-            "sessions_processed": [
-                {
-                    "session_id": session.session_id[:8] + "...",
-                    "email": "SET" if session.email else "NOT_SET",
-                    "user_type": session.user_type.value,
-                    "daily_questions": session.daily_question_count,
-                    "crm_eligible": session in crm_eligible_sessions
-                } for session in expired_sessions[:5]  # Show first 5 for debugging
-            ]
-        }
+        logger.info(f"✅ Background cleanup completed: {len(expired_sessions)} expired sessions processed, {crm_saved_count} saved to CRM")
         
     except Exception as e:
-        logger.critical(f"❌ Critical error in cleanup endpoint: {e}", exc_info=True)
-        return {
-            "success": False,
-            "message": f"Internal server error during cleanup: {str(e)}",
-            "reason": "internal_error",
-            "error_type": type(e).__name__,
-            "timestamp": datetime.now()
-        }
+        logger.critical(f"❌ Critical error in background cleanup: {e}", exc_info=True)
 
 async def _perform_cleanup_crm_save(session: UserSession, reason: str):
     """Background task for cleanup CRM saves - similar to emergency save"""
