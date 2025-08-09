@@ -1225,9 +1225,9 @@ async def _perform_full_cleanup_in_background():
 @app.get("/")
 async def root():
     return {
-        "message": "FiFi Emergency API - 504 Timeout FIXED + fifi.py Compatible",
+        "message": "FiFi Emergency API - 504 Timeout FIXED + fifi.py Compatible + Complete Cleanup",
         "status": "running",
-        "version": "3.3.1-fifi-compatible",
+        "version": "3.3.2-complete",
         "critical_fix": "Lazy database initialization prevents 504 Gateway Timeout",
         "compatibility": "100% compatible with fifi.py database schema and UserSession structure",
         "fixes_applied": [
@@ -1237,8 +1237,17 @@ async def root():
             "PRESERVED: Socket error resilience and auto-recovery",
             "PRESERVED: Background task processing",
             "ADDED: fifi.py compatibility (display_message_offset field)",
-            "ADDED: Backward compatibility for existing databases"
+            "ADDED: Backward compatibility for existing databases",
+            "COMPLETED: Full cleanup logic with 15-minute timeout and CRM eligibility rules"
         ],
+        "cleanup_logic": {
+            "15_minute_timeout_check": "Sessions inactive for 15+ minutes are processed",
+            "active_session_filter": "Only processes sessions where active = 1",
+            "crm_save_filter": "Only processes sessions where timeout_saved_to_crm = 0",
+            "crm_eligibility_rules": "Registered/verified users with email, messages, and 1+ questions",
+            "session_marking": "Marks processed sessions as active = 0",
+            "background_processing": "All heavy work done after endpoint response"
+        },
         "fifi_compatibility": {
             "database_schema": "32 columns (including display_message_offset)",
             "session_structure": "UserSession with all fifi.py fields",
@@ -1285,12 +1294,19 @@ async def comprehensive_diagnostics():
     try:
         diagnostics = {
             "timestamp": datetime.now(),
-            "version": "3.3.1-fifi-compatible",
+            "version": "3.3.2-complete",
             "timeout_fix_status": {
                 "lazy_database_initialization": "active",
                 "blocking_startup_eliminated": True,
                 "options_response_optimized": True,
                 "expected_cold_start_time": "< 5 seconds"
+            },
+            "cleanup_endpoint_status": {
+                "endpoint_available": True,
+                "background_processing": True,
+                "15_minute_timeout_logic": "implemented",
+                "crm_eligibility_rules": "complete",
+                "session_marking_logic": "active = 0 after processing"
             },
             "fifi_compatibility": {
                 "database_schema_compatible": True,
@@ -1443,6 +1459,6 @@ async def emergency_save(request: EmergencySaveRequest, background_tasks: Backgr
 
 if __name__ == "__main__":
     import uvicorn
-    logger.info("🚀 Starting FiFi Emergency API - 504 TIMEOUT FIXED + fifi.py Compatible...")
-    logger.info("🔑 Features: Lazy Database Init + Working CRM + PDF Attachments + Instant OPTIONS + fifi.py Schema Compatibility")
+    logger.info("🚀 Starting FiFi Emergency API - 504 TIMEOUT FIXED + fifi.py Compatible + Complete Cleanup...")
+    logger.info("🔑 Features: Lazy Database Init + Working CRM + PDF Attachments + Instant OPTIONS + fifi.py Schema + Complete 15-min Cleanup Logic")
     uvicorn.run(app, host="0.0.0.0", port=8000)
