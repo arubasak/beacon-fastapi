@@ -1351,7 +1351,7 @@ async def _perform_emergency_crm_save(session, reason: str):
             logger.critical(f"❌ Failed to end session even after critical error: {fallback_error}")
 
 async def _perform_full_cleanup_in_background():
-    """COMPLETELY IMPLEMENTED: Full cleanup logic with CRM processing and session marking"""
+    """COMPLETELY IMPLEMENTED: Full cleanup logic with INDIVIDUAL CRM PROCESSING"""
     try:
         logger.info("🔄 Background FULL CLEANUP task starting...")
         
@@ -1369,17 +1369,162 @@ async def _perform_full_cleanup_in_background():
         logger.info(f"✅ Background cleanup - Successfully processed {cleanup_result.get('cleaned_up_count', 0)} expired sessions")
         logger.info(f"📝 Background cleanup - Found {cleanup_result.get('crm_eligible_count', 0)} sessions eligible for CRM save")
         
-        # STEP 3: Process CRM-eligible sessions if any were found
+        # STEP 3: INDIVIDUAL CRM PROCESSING - THE MISSING PIECE!
         crm_eligible_count = cleanup_result.get('crm_eligible_count', 0)
         if crm_eligible_count > 0:
-            logger.info(f"🔄 Background cleanup - Processing {crm_eligible_count} sessions for CRM save...")
+            logger.info(f"🔄 Background cleanup - Starting INDIVIDUAL CRM processing for {crm_eligible_count} sessions...")
             
-            # Note: In a real implementation, you might want to process CRM saves here
-            # For now, we'll log that they were identified and would be processed
-            logger.info(f"📝 Background cleanup - {crm_eligible_count} sessions marked for CRM processing")
-            logger.info(f"ℹ️ Background cleanup - CRM saves will be handled by individual emergency save requests")
+            # Get the actual CRM-eligible sessions from cleanup result
+            crm_eligible_sessions = []
+            
+            # Re-query the CRM-eligible sessions for processing
+            if db_manager.db_type == "memory":
+                # For memory mode, get sessions from local storage
+                cutoff_time = datetime.now() - timedelta(minutes=15)
+                for session_id, session in list(db_manager.local_sessions.items()):
+                    if (not session.active and  # Already marked inactive by cleanup
+                        session.last_activity < cutoff_time and 
+                        not session.timeout_saved_to_crm and
+                        is_crm_eligible(session, is_emergency_save=False)):
+                        crm_eligible_sessions.append(session)
+            else:
+                # For database mode, re-query the sessions that were just marked inactive
+                try:
+                    cutoff_time = datetime.now() - timedelta(minutes=15)
+                    cutoff_iso = cutoff_time.isoformat()
+                    
+                    cursor = db_manager._execute_with_socket_retry("""
+                        SELECT session_id, user_type, email, full_name, zoho_contact_id, 
+                               created_at, last_activity, messages, active, wp_token, 
+                               timeout_saved_to_crm, fingerprint_id, fingerprint_method, 
+                               visitor_type, daily_question_count, total_question_count, 
+                               last_question_time, question_limit_reached, ban_status, 
+                               ban_start_time, ban_end_time, ban_reason, evasion_count, 
+                               current_penalty_hours, escalation_level, email_addresses_used, 
+                               email_switches_count, browser_privacy_level, registration_prompted, 
+                               registration_link_clicked, recognition_response, display_message_offset
+                        FROM sessions 
+                        WHERE active = 0 
+                        AND last_activity < ? 
+                        AND timeout_saved_to_crm = 0
+                        AND (user_type = 'registered_user' OR user_type = 'email_verified_guest')
+                        AND email IS NOT NULL 
+                        AND daily_question_count >= 1
+                    """, (cutoff_iso,))
+                    
+                    rows = cursor.fetchall()
+                    logger.info(f"🔍 Background CRM processing - Found {len(rows)} sessions to process for CRM")
+                    
+                    # Convert rows to UserSession objects for CRM processing
+                    for row in rows:
+                        if len(row) >= 31:
+                            try:
+                                loaded_display_message_offset = row[31] if len(row) > 31 else 0
+                                
+                                session = UserSession(
+                                    session_id=row[0],
+                                    user_type=UserType(row[1]) if row[1] else UserType.GUEST,
+                                    email=row[2],
+                                    full_name=row[3],
+                                    zoho_contact_id=row[4],
+                                    created_at=datetime.fromisoformat(row[5]) if row[5] else datetime.now(),
+                                    last_activity=datetime.fromisoformat(row[6]) if row[6] else datetime.now(),
+                                    messages=safe_json_loads(row[7], []),
+                                    active=bool(row[8]),
+                                    wp_token=row[9],
+                                    timeout_saved_to_crm=bool(row[10]),
+                                    fingerprint_id=row[11],
+                                    fingerprint_method=row[12],
+                                    visitor_type=row[13] or 'new_visitor',
+                                    daily_question_count=row[14] or 0,
+                                    total_question_count=row[15] or 0,
+                                    last_question_time=datetime.fromisoformat(row[16]) if row[16] else None,
+                                    question_limit_reached=bool(row[17]),
+                                    ban_status=BanStatus(row[18]) if row[18] else BanStatus.NONE,
+                                    ban_start_time=datetime.fromisoformat(row[19]) if row[19] else None,
+                                    ban_end_time=datetime.fromisoformat(row[20]) if row[20] else None,
+                                    ban_reason=row[21],
+                                    evasion_count=row[22] or 0,
+                                    current_penalty_hours=row[23] or 0,
+                                    escalation_level=row[24] or 0,
+                                    email_addresses_used=safe_json_loads(row[25], []),
+                                    email_switches_count=row[26] or 0,
+                                    browser_privacy_level=row[27],
+                                    registration_prompted=bool(row[28]),
+                                    registration_link_clicked=bool(row[29]),
+                                    recognition_response=row[30],
+                                    display_message_offset=loaded_display_message_offset
+                                )
+                                
+                                # Double-check CRM eligibility with timeout rules
+                                if is_crm_eligible(session, is_emergency_save=False):
+                                    crm_eligible_sessions.append(session)
+                                    
+                            except Exception as e:
+                                logger.error(f"❌ Background CRM processing failed to create UserSession from row: {e}")
+                                
+                except Exception as e:
+                    logger.error(f"❌ Background CRM processing failed to query sessions: {e}")
+                    crm_eligible_sessions = []
+            
+            # CRITICAL: Process each CRM-eligible session individually
+            crm_saved_count = 0
+            crm_failed_count = 0
+            
+            for session in crm_eligible_sessions:
+                try:
+                    logger.info(f"🔄 Background CRM processing session {session.session_id[:8]} - Email: {session.email}, Type: {session.user_type.value}, Questions: {session.daily_question_count}, Messages: {len(session.messages)}")
+                    
+                    # Individual CRM save for each session
+                    save_result = zoho_manager.save_chat_transcript_sync(session, "Automated Session Timeout Cleanup")
+                    
+                    if save_result.get("success"):
+                        # Update session data
+                        session.timeout_saved_to_crm = True  # CRITICAL: Mark as timeout-saved (not emergency)
+                        session.active = False  # Ensure it's marked inactive
+                        session.last_activity = datetime.now()
+                        
+                        # Update contact ID if returned from CRM
+                        if save_result.get("contact_id") and not session.zoho_contact_id:
+                            session.zoho_contact_id = save_result["contact_id"]
+                            logger.info(f"🔗 Background CRM - Saved contact ID {save_result['contact_id']} to session {session.session_id[:8]}")
+                        
+                        # Save updated session to database
+                        db_manager.save_session(session)
+                        crm_saved_count += 1
+                        
+                        logger.info(f"✅ Background CRM save completed for session {session.session_id[:8]} (PDF: {save_result.get('pdf_attached', False)}, Contact ID: {'SET' if session.zoho_contact_id else 'NOT_SET'})")
+                        
+                    else:
+                        crm_failed_count += 1
+                        logger.error(f"❌ Background CRM save failed for session {session.session_id[:8]}: {save_result.get('reason', 'unknown')}")
+                        
+                        # Even if CRM save fails, ensure session is marked as processed
+                        session.active = False
+                        session.last_activity = datetime.now()
+                        # Do NOT set timeout_saved_to_crm = True if CRM save failed
+                        db_manager.save_session(session)
+                        logger.info(f"🔒 Background CRM - Session {session.session_id[:8]} remains marked as INACTIVE despite CRM save failure")
+                    
+                except Exception as e:
+                    crm_failed_count += 1
+                    logger.critical(f"❌ Critical error in background CRM processing for session {session.session_id[:8]}: {e}", exc_info=True)
+                    
+                    # Even on critical error, ensure session is marked as processed
+                    try:
+                        session.active = False
+                        session.last_activity = datetime.now()
+                        db_manager.save_session(session)
+                        logger.info(f"🔒 Background CRM - Session {session.session_id[:8]} marked as INACTIVE after critical error")
+                    except Exception as fallback_error:
+                        logger.critical(f"❌ Failed to mark session inactive even after critical error: {fallback_error}")
+            
+            logger.info(f"✅ Background CRM processing completed: {len(crm_eligible_sessions)} sessions processed, {crm_saved_count} saved to CRM, {crm_failed_count} failed")
+            
+        else:
+            logger.info("✅ Background cleanup - No CRM-eligible sessions found")
         
-        logger.info("✅ Background cleanup completed successfully")
+        logger.info("✅ Background cleanup completed successfully with INDIVIDUAL CRM PROCESSING")
         
     except Exception as e:
         logger.critical(f"❌ Critical error in background cleanup: {e}", exc_info=True)
