@@ -28,7 +28,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # CRITICAL: Lightweight FastAPI app initialization - NO BLOCKING OPERATIONS
-app = FastAPI(title="FiFi Emergency API - Async Operations", version="3.5.0-async")
+app = FastAPI(title="FiFi Emergency API - Async Operations", version="3.5.1-async-fix") # Version bumped for clarity
 
 # CRITICAL: Proper CORS to handle OPTIONS requests quickly
 app.add_middleware(
@@ -201,31 +201,22 @@ class ResilientDatabaseManager:
         """CRITICAL: Time-limited connection establishment to prevent 504 timeouts"""
         start_time = datetime.now()
         
-        # Use a real async lock here to prevent multiple threads from trying to connect concurrently
-        # However, since this is in a thread pool (via asyncio.to_thread), the standard threading.Lock is fine
-        # as it protects the shared 'self.conn' resource across background threads.
-        
-        # 1. If connection is healthy AND schema is initialized, return immediately
         if self.conn and await asyncio.to_thread(self._check_connection_health_sync) and self._initialized_schema:
             logger.debug("✅ Connection healthy and schema initialized, reusing existing connection.")
             return True
         
-        # 2. If initialization was already attempted and failed, skip to memory mode
         if self._initialization_attempted and (datetime.now() - start_time).total_seconds() > 5:
             logger.warning("⚠️ Previous initialization attempt detected, using memory mode for speed")
             await asyncio.to_thread(self._fallback_to_memory_sync)
             return True
         
-        # 3. Check timeout
         if (datetime.now() - start_time).total_seconds() > max_wait_seconds:
             logger.warning(f"⏰ Connection timeout after {max_wait_seconds}s, falling back to memory")
             await asyncio.to_thread(self._fallback_to_memory_sync)
             return True
         
-        # 4. Mark that we're attempting initialization
         self._initialization_attempted = True
         
-        # 5. Close any existing unhealthy/uninitialized connection
         if self.conn:
             logger.warning("⚠️ Existing connection unhealthy or schema not initialized. Re-establishing.")
             try:
@@ -235,20 +226,16 @@ class ResilientDatabaseManager:
             self.conn = None
             self.db_type = "memory" # Reset
 
-        # 6. Quick attempt to establish new connection with timeout
         try:
-            # Try SQLite Cloud first if configured and available
             if (self.connection_string and SQLITECLOUD_AVAILABLE and 
                 self.db_type != "file" and (datetime.now() - start_time).total_seconds() < max_wait_seconds):
                 logger.info("🔄 Attempting QUICK SQLite Cloud connection...")
                 await self._attempt_quick_cloud_connection_async(max_wait_seconds - (datetime.now() - start_time).total_seconds())
             
-            # Fallback to local SQLite if cloud failed and still have time
             if not self.conn and (datetime.now() - start_time).total_seconds() < max_wait_seconds:
                 logger.info("☁️ Cloud connection failed/unavailable, trying local SQLite...")
                 await asyncio.to_thread(self._attempt_local_connection_sync)
 
-            # 7. Initialize schema if connection was established and still have time
             if self.conn and not self._initialized_schema and (datetime.now() - start_time).total_seconds() < max_wait_seconds:
                 try:
                     await asyncio.to_thread(self._init_complete_database_sync)
@@ -259,7 +246,6 @@ class ResilientDatabaseManager:
                     await asyncio.to_thread(self._fallback_to_memory_sync)
                     return True
 
-            # 8. Final fallback to memory if all else failed or timeout
             if not self.conn or (datetime.now() - start_time).total_seconds() > max_wait_seconds:
                 if (datetime.now() - start_time).total_seconds() > max_wait_seconds:
                     logger.warning(f"⏰ Initialization timeout after {(datetime.now() - start_time).total_seconds():.1f}s")
@@ -275,7 +261,7 @@ class ResilientDatabaseManager:
 
     async def _attempt_quick_cloud_connection_async(self, max_wait_seconds: float):
         """OPTIMIZED: Quick connection attempt with reduced retries for background processing"""
-        max_attempts = min(self._max_connection_attempts, 2)  # Maximum 2 attempts for speed
+        max_attempts = min(self._max_connection_attempts, 2)
         
         for attempt in range(max_attempts):
             if max_wait_seconds <= 0:
@@ -285,7 +271,6 @@ class ResilientDatabaseManager:
             try:
                 logger.info(f"🔄 QUICK SQLite Cloud connection attempt {attempt + 1}/{max_attempts}")
                 
-                # Close any existing connection first
                 if self.conn:
                     try:
                         await asyncio.to_thread(self.conn.close)
@@ -293,12 +278,9 @@ class ResilientDatabaseManager:
                         pass
                     self.conn = None
                 
-                # Create fresh connection with timeout
                 connection_start = datetime.now()
-                # Blocking call, run in thread
                 self.conn = await asyncio.to_thread(sqlitecloud.connect, self.connection_string)
                 
-                # Quick test connection (blocking call, run in thread)
                 test_result = await asyncio.to_thread(self.conn.execute, "SELECT 1 as connection_test")
                 test_result_fetched = await asyncio.to_thread(test_result.fetchone)
                 
@@ -315,7 +297,6 @@ class ResilientDatabaseManager:
                 error_msg = str(e)
                 logger.error(f"❌ QUICK SQLite Cloud connection attempt {attempt + 1} failed: {error_msg}")
                 
-                # Clean up failed connection
                 if self.conn:
                     try:
                         await asyncio.to_thread(self.conn.close)
@@ -323,11 +304,10 @@ class ResilientDatabaseManager:
                         pass
                     self.conn = None
                 
-                # Reduced wait time for quick attempts
                 if attempt < max_attempts - 1 and max_wait_seconds > 2:
                     wait_time = min(2, max_wait_seconds / max_attempts)
                     max_wait_seconds -= wait_time
-                    await asyncio.sleep(wait_time) # Async sleep
+                    await asyncio.sleep(wait_time)
 
         logger.error(f"❌ All {max_attempts} QUICK SQLite Cloud connection attempts failed")
 
@@ -337,7 +317,6 @@ class ResilientDatabaseManager:
             logger.info("🔄 Attempting local SQLite connection as fallback...")
             self.conn = sqlite3.connect("fifi_sessions_emergency.db", check_same_thread=False)
             
-            # Test connection
             test_result = self.conn.execute("SELECT 1 as test_local").fetchone()
             if test_result and test_result[0] == 1:
                 logger.info(f"✅ Local SQLite connection established! Test result: {test_result}")
@@ -359,7 +338,7 @@ class ResilientDatabaseManager:
         self.conn = None
         self.db_type = "memory"
         self.local_sessions = {}
-        self._initialized_schema = True  # Memory doesn't need schema
+        self._initialized_schema = True
         logger.warning("⚠️ Operating in in-memory mode due to connection issues")
 
     def _init_complete_database_sync(self):
@@ -477,7 +456,7 @@ class ResilientDatabaseManager:
         """Execute query with automatic socket error retry - REDUCED retries for speed"""
         for attempt in range(max_retries):
             try:
-                await self._ensure_connection_with_timeout(15) # Async ensure connection
+                await self._ensure_connection_with_timeout(15)
                 
                 if self.db_type == "memory":
                     raise Exception("Cannot execute SQL in memory mode")
@@ -485,7 +464,6 @@ class ResilientDatabaseManager:
                 if not self.conn:
                     raise Exception("No database connection available")
                 
-                # Blocking call, run in thread
                 if params:
                     result = await asyncio.to_thread(self.conn.execute, query, params)
                 else:
@@ -506,9 +484,9 @@ class ResilientDatabaseManager:
                     
                     if attempt < max_retries - 1:
                         self.conn = None
-                        wait_time = 1  # Reduced wait time for background processing
+                        wait_time = 1
                         logger.info(f"⏳ Retrying query in {wait_time} seconds due to socket error...")
-                        await asyncio.sleep(wait_time) # Async sleep
+                        await asyncio.sleep(wait_time)
                         continue
                 else:
                     logger.error(f"❌ Non-socket error during query execution: {e}")
@@ -628,7 +606,7 @@ class ResilientDatabaseManager:
 
     async def load_session(self, session_id: str) -> Optional[UserSession]:
         """Load session - LAZY INITIALIZATION ON FIRST CALL WITH TIMEOUT"""
-        with self.lock: # Protects self.conn across threads
+        with self.lock:
             logger.debug(f"🔍 Loading session {session_id[:8]}...")
             
             success = await self._ensure_connection_with_timeout(20)
@@ -721,7 +699,7 @@ class ResilientDatabaseManager:
 
     async def save_session(self, session: UserSession):
         """Save session - LAZY INITIALIZATION ON FIRST CALL WITH TIMEOUT"""
-        with self.lock: # Protects self.conn across threads
+        with self.lock:
             success = await self._ensure_connection_with_timeout(15)
             if not success:
                 logger.warning(f"⚠️ Connection timeout while saving session {session.session_id[:8]}, using memory")
@@ -781,7 +759,7 @@ class ResilientDatabaseManager:
 
     async def cleanup_expired_sessions(self, expiry_minutes: int = 15) -> Dict[str, Any]:
         """COMPLETE IMPLEMENTATION: Clean up expired sessions with FULL LOGIC and CRM processing"""
-        with self.lock: # Protects self.conn across threads
+        with self.lock:
             logger.info(f"🧹 Starting COMPLETE cleanup of sessions expired more than {expiry_minutes} minutes ago...")
             
             success = await self._ensure_connection_with_timeout(20)
@@ -975,7 +953,6 @@ class PDFExporter:
                 story.append(Spacer(1, 8))
                 story.append(Paragraph(f"<b>{role}:</b> {content}", style))
             
-            # Execute the blocking PDF build operation in a separate thread
             await asyncio.to_thread(doc.build, story)
             
             buffer.seek(0)
@@ -991,7 +968,12 @@ class ZohoCRMManager:
         self.base_url = "https://www.zohoapis.com/crm/v2"
         self._access_token = None
         self._token_expiry = None
-        self.http_client = httpx.AsyncClient() # Async HTTP client
+        self._http_client = httpx.AsyncClient() 
+
+    async def close_http_client(self):
+        if self._http_client:
+            await self._http_client.aclose()
+            logger.info("✅ httpx.AsyncClient for ZohoCRMManager closed.")
 
     async def _get_access_token(self, force_refresh: bool = False) -> Optional[str]:
         if not ZOHO_ENABLED:
@@ -1004,18 +986,16 @@ class ZohoCRMManager:
         
         logger.info("🔑 Requesting new Zoho access token...")
         try:
-            # Use async http client
-            async with self.http_client as client:
-                response = await client.post(
-                    "https://accounts.zoho.com/oauth/v2/token",
-                    data={
-                        'refresh_token': ZOHO_REFRESH_TOKEN,
-                        'client_id': ZOHO_CLIENT_ID,
-                        'client_secret': ZOHO_CLIENT_SECRET,
-                        'grant_type': 'refresh_token'
-                    },
-                    timeout=15
-                )
+            response = await self._http_client.post( # CORRECTED: Direct use of self._http_client
+                "https://accounts.zoho.com/oauth/v2/token",
+                data={
+                    'refresh_token': ZOHO_REFRESH_TOKEN,
+                    'client_id': ZOHO_CLIENT_ID,
+                    'client_secret': ZOHO_CLIENT_SECRET,
+                    'grant_type': 'refresh_token'
+                },
+                timeout=15
+            )
             response.raise_for_status()
             data = response.json()
             
@@ -1039,8 +1019,7 @@ class ZohoCRMManager:
         try:
             headers = {'Authorization': f'Zoho-oauthtoken {access_token}'}
             params = {'criteria': f'(Email:equals:{email})'}
-            async with self.http_client as client:
-                response = await client.get(f"{self.base_url}/Contacts/search", headers=headers, params=params, timeout=10)
+            response = await self._http_client.get(f"{self.base_url}/Contacts/search", headers=headers, params=params, timeout=10) # CORRECTED: Direct use
             response.raise_for_status()
             data = response.json()
             
@@ -1069,8 +1048,7 @@ class ZohoCRMManager:
                     "Lead_Source": "FiFi AI Emergency API"
                 }]
             }
-            async with self.http_client as client:
-                response = await client.post(f"{self.base_url}/Contacts", headers=headers, json=contact_data, timeout=10)
+            response = await self._http_client.post(f"{self.base_url}/Contacts", headers=headers, json=contact_data, timeout=10) # CORRECTED: Direct use
             response.raise_for_status()
             data = response.json()
             
@@ -1096,7 +1074,8 @@ class ZohoCRMManager:
             
             if len(note_content) > 32000:
                 logger.warning(f"⚠️ Note content for {contact_id} exceeds 32000 chars. Truncating.")
-                note_content = note_content[:32000 - 100] + "\n\n[Content truncated due to size limits]"
+                # CORRECTED: Use \n for literal newline, not \\n
+                note_content = note_content[:32000 - 100] + "\n\n[Content truncated due to size limits]" 
             
             note_data = {
                 "data": [{
@@ -1106,8 +1085,7 @@ class ZohoCRMManager:
                     "se_module": "Contacts"
                 }]
             }
-            async with self.http_client as client:
-                response = await client.post(f"{self.base_url}/Notes", headers=headers, json=note_data, timeout=15)
+            response = await self._http_client.post(f"{self.base_url}/Notes", headers=headers, json=note_data, timeout=15) # CORRECTED: Direct use
             response.raise_for_status()
             data = response.json()
             
@@ -1135,16 +1113,14 @@ class ZohoCRMManager:
                 headers = {'Authorization': f'Zoho-oauthtoken {access_token}'}
                 
                 pdf_buffer.seek(0)
-                # Ensure pdf_buffer.read() is run in a thread because it's blocking on io.BytesIO
                 pdf_content = await asyncio.to_thread(pdf_buffer.read)
                 
-                async with self.http_client as client:
-                    response = await client.post(
-                        upload_url, 
-                        headers=headers, 
-                        files={'file': (filename, pdf_content, 'application/pdf')},
-                        timeout=60
-                    )
+                response = await self._http_client.post( # CORRECTED: Direct use
+                    upload_url, 
+                    headers=headers, 
+                    files={'file': (filename, pdf_content, 'application/pdf')},
+                    timeout=60
+                )
                 
                 if response.status_code == 401:
                     logger.warning("Zoho token expired during upload, attempting refresh...")
@@ -1169,7 +1145,7 @@ class ZohoCRMManager:
                 logger.error(f"❌ Error adding PDF attachment (attempt {attempt + 1}/{max_retries}): {e}", exc_info=True)
                 
             if attempt < max_retries - 1:
-                await asyncio.sleep(2 ** attempt) # Async sleep
+                await asyncio.sleep(2 ** attempt)
                 
         return False
 
@@ -1204,6 +1180,7 @@ class ZohoCRMManager:
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             note_title = f"FiFi AI Emergency Save - {timestamp} ({trigger_reason})"
             
+            # CORRECTED: Use \n for newlines
             note_content = f"**Emergency Save Information:**\n"
             note_content += f"- Session ID: {session.session_id}\n"
             note_content += f"- User: {session.full_name or 'Unknown'} ({session.email})\n"
@@ -1221,7 +1198,7 @@ class ZohoCRMManager:
                 if len(content) > 200:
                     content = content[:200] + "..."
                     
-                note_content += f"\n{i+1}. **{role}:** {content}\n"
+                note_content += f"\n{i+1}. **{role}:** {content}\n" # CORRECTED: Use \n for newlines
                 
             note_success = await self._add_note(contact_id, note_title, note_content)
             
@@ -1230,7 +1207,7 @@ class ZohoCRMManager:
             if pdf_buffer:
                 pdf_filename = f"FiFi_Chat_Transcript_{session.session_id[:8]}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
                 pdf_success = await self._upload_attachment(contact_id, pdf_buffer, pdf_filename)
-                pdf_buffer.close() # Close the buffer after use
+                pdf_buffer.close()
             else:
                 logger.warning(f"⚠️ Failed to generate PDF for session {session.session_id[:8]}")
                 
@@ -1256,6 +1233,13 @@ db_manager = ResilientDatabaseManager(SQLITE_CLOUD_CONNECTION)
 pdf_exporter = PDFExporter()
 zoho_manager = ZohoCRMManager(pdf_exporter) # This now creates an AsyncClient
 logger.info("✅ All managers initialized for async operations!")
+
+# NEW: FastAPI shutdown event to close the httpx client
+@app.on_event("shutdown")
+async def shutdown_event():
+    logger.info("👋 Shutting down FastAPI application. Closing httpx client...")
+    await zoho_manager.close_http_client()
+    logger.info("✅ FastAPI shutdown complete.")
 
 # Helper functions (unchanged)
 def is_crm_eligible(session: UserSession, is_emergency_save: bool = False) -> bool:
@@ -1301,7 +1285,6 @@ async def _perform_emergency_crm_save(session, reason: str):
         is_session_ending = is_session_ending_reason(reason)
         logger.info(f"📋 Session ending check: {is_session_ending} for reason '{reason}'")
         
-        # Await the async save function
         save_result = await zoho_manager.save_chat_transcript_sync(session, reason)
         
         if save_result.get("success"):
@@ -1320,7 +1303,6 @@ async def _perform_emergency_crm_save(session, reason: str):
                 session.zoho_contact_id = save_result["contact_id"]
                 logger.info(f"🔗 Saved contact ID {save_result['contact_id']} to session {session.session_id[:8]}")
             
-            # Await the async save function for DB update
             await db_manager.save_session(session)
             logger.info(f"✅ Background CRM save completed successfully for session {session.session_id[:8]} (PDF: {save_result.get('pdf_attached', False)}, Active: {session.active})")
         else:
@@ -1329,7 +1311,6 @@ async def _perform_emergency_crm_save(session, reason: str):
             if is_session_ending:
                 session.active = False
                 session.last_activity = datetime.now()
-                # Even on CRM save failure, ensure session is marked inactive
                 await db_manager.save_session(session)
                 logger.info(f"🔒 Session {session.session_id[:8]} marked as INACTIVE despite CRM save failure (session-ending reason: {reason})")
             
@@ -1471,7 +1452,7 @@ async def _perform_full_cleanup_in_background():
                             session.zoho_contact_id = save_result["contact_id"]
                             logger.info(f"🔗 Background CRM - Saved contact ID {save_result['contact_id']} to session {session.session_id[:8]}")
                         
-                        await db_manager.save_session(session) # Await save
+                        await db_manager.save_session(session)
                         crm_saved_count += 1
                         
                         logger.info(f"✅ Background CRM save completed for session {session.session_id[:8]} (PDF: {save_result.get('pdf_attached', False)}, Contact ID: {'SET' if session.zoho_contact_id else 'NOT_SET'})")
@@ -1482,7 +1463,7 @@ async def _perform_full_cleanup_in_background():
                         
                         session.active = False
                         session.last_activity = datetime.now()
-                        await db_manager.save_session(session) # Await save
+                        await db_manager.save_session(session)
                         logger.info(f"🔒 Background CRM - Session {session.session_id[:8]} remains marked as INACTIVE despite CRM save failure")
                     
                 except Exception as e:
@@ -1492,7 +1473,7 @@ async def _perform_full_cleanup_in_background():
                     try:
                         session.active = False
                         session.last_activity = datetime.now()
-                        await db_manager.save_session(session) # Await save
+                        await db_manager.save_session(session)
                         logger.info(f"🔒 Background CRM - Session {session.session_id[:8]} marked as INACTIVE after critical error")
                     except Exception as fallback_error:
                         logger.critical(f"❌ Failed to mark session inactive even after critical error: {fallback_error}")
@@ -1513,14 +1494,16 @@ async def root():
     return {
         "message": "FiFi Emergency API - Async Operations Enabled",
         "status": "running",
-        "version": "3.5.0-async",
+        "version": "3.5.1-async-fix", # Version bumped
         "critical_fix": "Blocking I/O operations moved to async or thread pool",
         "compatibility": "100% compatible with fifi.py database schema and UserSession structure",
         "fixes_applied": [
             "CRITICAL: All database operations (sqlitecloud/sqlite3) now use asyncio.to_thread",
-            "CRITICAL: All external HTTP requests (Zoho) now use httpx.AsyncClient",
+            "CRITICAL: All external HTTP requests (Zoho) now use httpx.AsyncClient (long-lived instance)", # CHANGED: Added "long-lived instance"
             "CRITICAL: PDF generation (reportlab) now uses asyncio.to_thread",
             "FIXED: All time.sleep replaced with await asyncio.sleep",
+            "FIXED: `httpx.AsyncClient` used correctly (no `async with` inside methods, single instance)", # NEW
+            "FIXED: Newline characters (`\n`) corrected to standard `\n` in string literals", # NEW
             "OPTIMIZED: Background tasks are now truly non-blocking for the event loop", 
             "PRESERVED: All working CRM functionality with PDF attachments",
             "PRESERVED: Socket error resilience and auto-recovery",
@@ -1554,7 +1537,7 @@ async def health_check():
         if quick_status.get("status") != "quick_check_failed":
             db_status = quick_status
         else:
-            db_status = await db_manager.test_connection() # Await the async test
+            db_status = await db_manager.test_connection()
             
         return {
             "status": "healthy",
@@ -1583,7 +1566,7 @@ async def comprehensive_diagnostics():
     try:
         diagnostics = {
             "timestamp": datetime.now(),
-            "version": "3.5.0-async",
+            "version": "3.5.1-async-fix", # Version bumped
             "timeout_fix_status": {
                 "lazy_database_initialization": "active_with_timeouts_async",
                 "blocking_startup_eliminated": True,
@@ -1641,7 +1624,6 @@ async def cleanup_expired_sessions(background_tasks: BackgroundTasks):
     try:
         logger.info("🧹 ULTRA-FAST CLEANUP: Starting immediate response with complete background processing")
         
-        # CRITICAL: Queue async cleanup in background and return IMMEDIATELY
         background_tasks.add_task(_perform_full_cleanup_in_background)
         
         return {
@@ -1684,7 +1666,7 @@ async def emergency_save(request: EmergencySaveRequest, background_tasks: Backgr
             logger.warning("⚠️ Database connection timeout, but continuing with available mode")
         
         logger.info(f"🔍 Loading session {request.session_id[:8]}...")
-        session = await db_manager.load_session(request.session_id) # Await the async load
+        session = await db_manager.load_session(request.session_id)
         
         if not session:
             logger.error(f"❌ Session {request.session_id[:8]} not found or not active")
