@@ -757,7 +757,7 @@ class ResilientDatabaseManager:
                 self.local_sessions[session.session_id] = copy.deepcopy(session)
                 logger.warning(f"⚠️ Saved session {session.session_id[:8]} to memory as fallback")
 
-    async def cleanup_expired_sessions(self, expiry_minutes: int = 15) -> Dict[str, Any]:
+    async def cleanup_expired_sessions(self, expiry_minutes: int = 5) -> Dict[str, Any]:
         """COMPLETE IMPLEMENTATION: Clean up expired sessions with FULL LOGIC and CRM processing"""
         with self.lock:
             logger.info(f"🧹 Starting COMPLETE cleanup of sessions expired more than {expiry_minutes} minutes ago...")
@@ -1313,8 +1313,8 @@ def is_crm_eligible(session: UserSession, is_emergency_save: bool = False) -> bo
             elapsed_time = datetime.now() - start_time
             elapsed_minutes = elapsed_time.total_seconds() / 60
             
-            if elapsed_minutes < 15.0:
-                logger.debug(f"CRM Eligibility for {session.session_id[:8]}: Less than 15 minutes active ({elapsed_minutes:.1f} min).")
+            if elapsed_minutes < 5.0:
+                logger.debug(f"CRM Eligibility for {session.session_id[:8]}: Less than 5 minutes active ({elapsed_minutes:.1f} min).")
                 return False
             
             logger.debug(f"CRM Eligibility for {session.session_id[:8]}: All checks passed. UserType={session.user_type.value}, Questions={session.daily_question_count}, Elapsed={elapsed_minutes:.1f}min.")
