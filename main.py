@@ -257,7 +257,7 @@ class ResilientDatabaseManager:
                 try:
                     await asyncio.to_thread(self._init_complete_database_sync) # Ensure schema exists if not yet
                     self._initialized_schema = True
-                    logger.info("✅ Ensured schema initialized on reuse.")
+                    logger.info("✅ Ensured schema initialized on reuse..")
                 except Exception as e:
                     logger.error(f"❌ Schema check on reuse failed: {e}. Forcing re-connection.", exc_info=True)
                     self.conn = None # Invalidate so it tries to re-connect
@@ -300,7 +300,9 @@ class ResilientDatabaseManager:
         cloud_connection_successful = False
         if self.connection_string and SQLITECLOUD_AVAILABLE:
             try:
-                await self._attempt_quick_cloud_connection_async(max_wait_seconds - (datetime.now() - start_time).total_seconds())
+                # ADOPTED FROM FIFI.PY: Removed 'timeout' argument from sqlitecloud.connect
+                self.conn = await asyncio.to_thread(sqlitecloud.connect, self.connection_string)
+                
                 if self.conn and self.db_type == "cloud":
                     cloud_connection_successful = True
             except Exception as e:
@@ -355,7 +357,7 @@ class ResilientDatabaseManager:
                     self.conn = None
                 
                 connection_start_attempt = datetime.now()
-                # Pass a timeout to the underlying connect method if possible (sqlitecloud supports `timeout` param)
+                # ADOPTED FROM FIFI.PY: Removed 'timeout' argument here
                 self.conn = await asyncio.to_thread(sqlitecloud.connect, self.connection_string)
                 
                 # Test the connection to confirm it's truly open
@@ -1632,7 +1634,8 @@ async def root():
             "SYNTAX ERROR FIX: Fixed orphaned else block in cleanup_expired_sessions method",
             "FIXED: PDFExporter: Corrected `SimpleDocDocument` to `SimpleDocTemplate`",
             "FIXED: `KeyError: \"Style 'Heading1' already defined in stylesheet\"` by removing redundant style additions in `PDFExporter`'s `__init__`.",
-            "FIXED: `no such table: sessions` error by ensuring schema initialization is attempted when a new persistent database connection is established."
+            "FIXED: `no such table: sessions` error by ensuring schema initialization is attempted when a new persistent database connection is established.",
+            "FIXED: `connect() got an unexpected keyword argument 'timeout'` by removing the `timeout` parameter from `sqlitecloud.connect` calls to align with `fifi.py`."
         ],
         "cleanup_logic_complete": {
             "5_minute_timeout_check": "IMPLEMENTED - Sessions inactive for 5+ minutes are processed",
