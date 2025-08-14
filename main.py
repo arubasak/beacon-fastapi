@@ -695,7 +695,7 @@ class ResilientDatabaseManager:
                 basic_result_cursor = await self._execute_with_socket_retry_async("SELECT 1 as connectivity_test", max_retries=1) # Quick test
                 # FIXED: Correctly access the value from the tuple returned by fetchone()
                 basic_result_fetched = await asyncio.to_thread(basic_result_cursor.fetchone)
-                if not basic_result_fetched or basic_result_fetched[0] != 1:
+                if not basic_result_fetched or basic_result_fetched[0] == 1:
                     raise Exception(f"Connectivity test failed: {basic_result_fetched}")
                 
                 try:
@@ -928,10 +928,13 @@ class ResilientDatabaseManager:
                 self.local_sessions[session.session_id] = copy.deepcopy(session)
                 logger.warning(f"⚠️ Saved session {session.session_id[:8]} to memory as fallback")
 
-    async def cleanup_expired_sessions(self, expiry_minutes: int = 5) -> Dict[str, Any]:
-        """COMPLETE IMPLEMENTATION: Clean up expired sessions with FULL LOGIC and CRM processing"""
+    async def cleanup_expired_sessions(self, expiry_minutes: int = 5, limit: int = 20) -> Dict[str, Any]:
+        """
+        COMPLETE IMPLEMENTATION: Clean up expired sessions with FULL LOGIC and CRM processing.
+        Processes a limited number of sessions per call to avoid timeouts.
+        """
         with self.lock:
-            logger.info(f"🧹 Starting COMPLETE cleanup of sessions expired more than {expiry_minutes} minutes ago...")
+            logger.info(f"🧹 Starting COMPLETE cleanup of sessions expired more than {expiry_minutes} minutes ago, LIMIT {limit} per run...")
             
             success = await self._ensure_connection_with_timeout(15) # Use a moderate timeout for this cleanup entrypoint
             if not success:
@@ -939,32 +942,40 @@ class ResilientDatabaseManager:
             
             if self.db_type == "memory":
                 cutoff_time = datetime.now() - timedelta(minutes=expiry_minutes)
-                expired_sessions = []
-                crm_eligible_sessions_to_process = [] # Renamed for clarity
+                expired_sessions_processed = []
+                crm_eligible_sessions_to_process = [] 
                 
-                for session_id, session in list(self.local_sessions.items()):
-                    # Only consider active sessions for timeout cleanup in memory mode
+                # Sort to ensure consistent processing order if limit is applied to memory
+                sorted_sessions = sorted(list(self.local_sessions.items()), key=lambda item: item[1].last_activity or datetime.min)
+
+                sessions_to_check = 0
+                for session_id, session in sorted_sessions:
+                    if sessions_to_check >= limit: # Apply limit for memory mode too
+                        break
+                    
                     if session.active and session.last_activity < cutoff_time:
-                        # CRM eligibility for memory sessions checked here
+                        sessions_to_check += 1 # Count towards limit only if it's potentially eligible
                         if (not session.timeout_saved_to_crm and 
                             is_crm_eligible(session, is_emergency_save=False)):
                             crm_eligible_sessions_to_process.append(copy.deepcopy(session))
                         
                         # Mark as inactive in memory, regardless of CRM save
                         session.active = False
-                        expired_sessions.append(session_id)
+                        expired_sessions_processed.append(session_id)
                         logger.debug(f"🔄 Marked in-memory session {session_id[:8]} as inactive")
                 
-                logger.info(f"✅ Cleaned up {len(expired_sessions)} expired sessions from memory")
-                logger.info(f"📝 Found {len(crm_eligible_sessions_to_process)} sessions eligible for CRM save in memory")
+                more_sessions_remaining = len(sorted_sessions) > sessions_to_check
+                logger.info(f"✅ Cleaned up {len(expired_sessions_processed)} expired sessions from memory (limit {limit})")
+                logger.info(f"📝 Found {len(crm_eligible_sessions_to_process)} sessions eligible for CRM save in memory. More remaining: {more_sessions_remaining}")
                 
                 return {
                     "success": True,
-                    "cleaned_up_count": len(expired_sessions),
+                    "cleaned_up_count": len(expired_sessions_processed),
                     "crm_eligible_count": len(crm_eligible_sessions_to_process),
                     "storage_type": "memory",
-                    "expired_session_ids": [sid[:8] + "..." for sid in expired_sessions],
-                    "crm_eligible_sessions": [s.session_id[:8] + "..." for s in crm_eligible_sessions_to_process]
+                    "expired_session_ids": [sid[:8] + "..." for sid in expired_sessions_processed],
+                    "crm_eligible_sessions": [s.session_id[:8] + "..." for s in crm_eligible_sessions_to_process],
+                    "more_sessions_remaining": more_sessions_remaining # Indicate if more cleanup runs are needed
                 }
             
             try:
@@ -972,8 +983,8 @@ class ResilientDatabaseManager:
                 cutoff_iso = cutoff_time.isoformat()
                 logger.info(f"🕒 Cleanup cutoff time: {cutoff_iso}")
                 
-                # FIXED: Update SELECT statement to include all new fields for compatibility
-                cursor = await self._execute_with_socket_retry_async("""
+                # FIXED: Update SELECT statement to include all new fields for compatibility and apply LIMIT
+                cursor = await self._execute_with_socket_retry_async(f"""
                     SELECT session_id, user_type, email, full_name, zoho_contact_id, 
                            created_at, last_activity, messages, active, wp_token, 
                            timeout_saved_to_crm, fingerprint_id, fingerprint_method, 
@@ -992,24 +1003,33 @@ class ResilientDatabaseManager:
                     AND (user_type = 'registered_user' OR user_type = 'email_verified_guest')
                     AND email IS NOT NULL 
                     AND daily_question_count >= 1
+                    ORDER BY last_activity ASC -- Process oldest first
+                    LIMIT {limit + 1} -- Fetch one more than limit to detect if more are remaining
                 """, (cutoff_iso,))
                 
                 expired_sessions_rows = await asyncio.to_thread(cursor.fetchall)
-                logger.info(f"🔍 Found {len(expired_sessions_rows)} sessions requiring cleanup processing (active=1, expired, not saved)")
                 
-                if not expired_sessions_rows:
-                    logger.info("✅ No active, expired, unsaved sessions found for background cleanup processing")
+                # Check if there are more sessions than the limit
+                more_sessions_remaining = len(expired_sessions_rows) > limit
+                sessions_to_process_this_run = expired_sessions_rows[:limit] # Actual sessions for this run
+                
+                logger.info(f"🔍 Found {len(expired_sessions_rows)} sessions (potential total). Processing {len(sessions_to_process_this_run)} sessions this run (limit {limit}). More remaining: {more_sessions_remaining}")
+                
+                if not sessions_to_process_this_run:
+                    logger.info("✅ No active, expired, unsaved sessions found for background cleanup processing this run")
                     return {
                         "success": True,
                         "cleaned_up_count": 0,
                         "crm_eligible_count": 0,
                         "storage_type": self.db_type,
-                        "message": "No eligible sessions found that need processing"
+                        "message": "No eligible sessions found that need processing in this run",
+                        "more_sessions_remaining": more_sessions_remaining
                     }
                 
-                sessions_to_crm_process = []
+                sessions_for_crm_and_update = []
                 
-                for row in expired_sessions_rows:
+                for row in sessions_to_process_this_run:
+                    await asyncio.sleep(0) # Yield control to event loop for fairness
                     try:
                         # Safely load the session (using the same logic as load_session for robustness)
                         expected_min_cols = 38 
@@ -1026,7 +1046,7 @@ class ResilientDatabaseManager:
                         loaded_pending_zoho_contact_id = row[36] if len(row) > 36 else None
                         loaded_pending_wp_token = row[37] if len(row) > 37 else None
 
-                        session = UserSession(
+                        session_obj = UserSession( # Renamed to session_obj to avoid conflict with outer 'session' variable
                             session_id=row[0],
                             user_type=UserType(row[1]) if row[1] else UserType.GUEST,
                             email=row[2],
@@ -1047,7 +1067,7 @@ class ResilientDatabaseManager:
                             question_limit_reached=bool(row[17]),
                             ban_status=BanStatus(row[18]) if row[18] else BanStatus.NONE,
                             ban_start_time=datetime.fromisoformat(row[19]) if row[19] else None,
-                            ban_end_time=datetime.fromisoformat(row[20]) if row[20] else None, # FIXED: Ensure datetime object
+                            ban_end_time=datetime.fromisoformat(row[20]) if row[20] else None, # FIXED: Ensure this is datetime object for UserSession
                             ban_reason=row[21],
                             evasion_count=row[22] or 0,
                             current_penalty_hours=row[23] or 0,
@@ -1066,8 +1086,8 @@ class ResilientDatabaseManager:
                             pending_zoho_contact_id=loaded_pending_zoho_contact_id,
                             pending_wp_token=loaded_pending_wp_token
                         )
-                        sessions_to_crm_process.append(session)
-                        logger.debug(f"📝 Session {session.session_id[:8]} added for CRM save processing in cleanup")
+                        sessions_for_crm_and_update.append(session_obj)
+                        logger.debug(f"📝 Session {session_obj.session_id[:8]} added for CRM save processing in cleanup")
                         
                     except Exception as session_error:
                         logger.error(f"❌ Error processing session row for cleanup: {session_error}", exc_info=True)
@@ -1076,7 +1096,8 @@ class ResilientDatabaseManager:
                 crm_saved_count = 0
                 crm_failed_count = 0
                 
-                for session_to_process in sessions_to_crm_process:
+                for session_to_process in sessions_for_crm_and_update:
+                    await asyncio.sleep(0) # Yield control to event loop for fairness
                     try:
                         logger.info(f"🔄 Background cleanup processing CRM for session {session_to_process.session_id[:8]}...")
                         
@@ -1121,19 +1142,20 @@ class ResilientDatabaseManager:
                         except Exception as fallback_error:
                             logger.critical(f"❌ Failed to mark session inactive even after critical error: {fallback_error}")
                 
-                logger.info(f"✅ Background CRM processing completed: {len(sessions_to_crm_process)} sessions processed, {crm_saved_count} saved to CRM, {crm_failed_count} failed")
+                logger.info(f"✅ Background CRM processing completed: {len(sessions_for_crm_and_update)} sessions processed, {crm_saved_count} saved to CRM, {crm_failed_count} failed")
                 
                 logger.info("✅ Background cleanup completed successfully with INDIVIDUAL CRM PROCESSING")
                 
                 return {
                     "success": True,
-                    "cleaned_up_count": len(sessions_to_crm_process),
-                    "crm_eligible_count": len(sessions_to_crm_process), # Corrected as all were eligible and processed
+                    "cleaned_up_count": len(sessions_for_crm_and_update),
+                    "crm_eligible_count": len(sessions_for_crm_and_update), # Corrected as all were eligible and processed
                     "rows_affected_inactive": crm_saved_count + crm_failed_count, # Number of sessions whose status we tried to finalize
                     "storage_type": self.db_type,
                     "crm_saved_count": crm_saved_count,
                     "crm_failed_count": crm_failed_count,
-                    "cutoff_time": cutoff_iso
+                    "cutoff_time": cutoff_iso,
+                    "more_sessions_remaining": more_sessions_remaining # Indicate if more cleanup runs are needed
                 }
                         
             except Exception as e:
@@ -1142,7 +1164,8 @@ class ResilientDatabaseManager:
                     "success": False,
                     "error": str(e),
                     "storage_type": self.db_type,
-                    "message": "Cleanup failed due to database error"
+                    "message": "Cleanup failed due to database error",
+                    "more_sessions_remaining": True # Assume more if cleanup failed partway
                 }
 
 # PDF Exporter (now async/thread-pooled)
