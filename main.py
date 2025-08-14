@@ -372,6 +372,12 @@ class ResilientDatabaseManager:
                 # FIXED: Correctly access the value from the tuple returned by fetchone()
                 test_result_fetched = await asyncio.to_thread(test_result.fetchone)
                 
+                # --- NEW DEBUGGING LOGGING ---
+                logger.error(f"DEBUG: _attempt_quick_cloud_connection_async fetched result: {test_result_fetched}, type: {type(test_result_fetched)}")
+                if test_result_fetched is not None and isinstance(test_result_fetched, tuple) and len(test_result_fetched) > 0:
+                    logger.error(f"DEBUG: _attempt_quick_cloud_connection_async fetched result[0]: {test_result_fetched[0]}, type: {type(test_result_fetched[0])}")
+                # --- END NEW DEBUGGING LOGGING ---
+
                 if test_result_fetched and test_result_fetched[0] == 1: 
                     logger.info(f"✅ QUICK SQLite Cloud connection established using {self._auth_method}!")
                     self.db_type = "cloud"
@@ -693,9 +699,15 @@ class ResilientDatabaseManager:
             
             try:
                 basic_result_cursor = await self._execute_with_socket_retry_async("SELECT 1 as connectivity_test", max_retries=1) # Quick test
-                # FIXED: Correctly access the value from the tuple returned by fetchone()
                 basic_result_fetched = await asyncio.to_thread(basic_result_cursor.fetchone)
-                if not basic_result_fetched or basic_result_fetched[0] == 1:
+                
+                # --- NEW DEBUGGING LOGGING ---
+                logger.error(f"DEBUG: test_connection fetched result: {basic_result_fetched}, type: {type(basic_result_fetched)}")
+                if basic_result_fetched is not None and isinstance(basic_result_fetched, tuple) and len(basic_result_fetched) > 0:
+                    logger.error(f"DEBUG: test_connection fetched result[0]: {basic_result_fetched[0]}, type: {type(basic_result_fetched[0])}")
+                # --- END NEW DEBUGGING LOGGING ---
+
+                if not basic_result_fetched or basic_result_fetched[0] != 1:
                     raise Exception(f"Connectivity test failed: {basic_result_fetched}")
                 
                 try:
@@ -1681,7 +1693,8 @@ async def root():
             "ENHANCED: More verbose logging for SQLite Cloud connection failures in `_ensure_connection_with_timeout`.",
             "CRITICAL FIX: Schema initialization now correctly handles `sqlitecloud.exceptions.SQLiteCloudOperationalError` for 'duplicate column name' errors, preventing fallback to memory.",
             "CRITICAL FIX: Removed message content truncation in PDF generation for full chat transcripts.",
-            "CRITICAL FIX: Removed individual message content truncation within Zoho Notes content generation for full detail (Zoho API's 32k character limit for entire note remains)." # NEW FIX
+            "CRITICAL FIX: Removed individual message content truncation within Zoho Notes content generation for full detail (Zoho API's 32k character limit for entire note remains).",
+            "ENHANCED: Added debug logging for `test_connection` and `_attempt_quick_cloud_connection_async` to diagnose unexpected `fetchone()` results." # NEW FIX
         ],
         "cleanup_logic_complete": {
             "5_minute_timeout_check": "IMPLEMENTED - Sessions inactive for 5+ minutes are processed",
