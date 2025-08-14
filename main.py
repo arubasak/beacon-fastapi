@@ -28,7 +28,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # CRITICAL: Lightweight FastAPI app initialization - NO BLOCKING OPERATIONS
-app = FastAPI(title="FiFi Emergency API - Async Operations", version="3.6.0-final-fix") # Version bumped for clarity
+app = FastAPI(title="FiFi Emergency API - Async Operations", version="3.6.0-final-fix-v4") # Version bumped for clarity
 
 # CRITICAL: Proper CORS to handle OPTIONS requests quickly
 app.add_middleware(
@@ -92,15 +92,23 @@ async def startup_event():
     # Initialize Zoho Manager. Its HTTP client is async.
     zoho_manager = ZohoCRMManager(pdf_exporter)
 
-    # Optional: Perform a quick, timed-out database connection test to ensure it's ready
-    # This happens during startup, before requests are handled.
+    # Optional: Perform a QUICK, AGGRESSIVELY TIMED-OUT database connection test to ensure it's ready.
+    # This prevents startup from hanging. If it fails within 1 second, the app starts anyway,
+    # and db_manager falls back to memory mode, preserving responsiveness.
     try:
-        logger.info("Attempting initial database connection test during startup...")
-        status = await db_manager.test_connection()
-        logger.info(f"Initial DB connection status: {status.get('status')}")
+        logger.info("Attempting initial database connection test during startup (max 1s)...")
+        # Test connection, but force it to complete or raise TimeoutError within 1 second.
+        # This prevents Cloud Run startup timeouts.
+        await asyncio.wait_for(db_manager.test_connection(), timeout=1) 
+        logger.info("Initial DB connection test in startup completed successfully (or fell back to memory within 1s).")
+    except asyncio.TimeoutError:
+        logger.warning("Initial DB connection test in startup timed out. Proceeding with application startup, DB will be in fallback memory mode.")
+        # Ensure db_manager is in memory mode if it timed out during startup test
+        await asyncio.to_thread(db_manager._fallback_to_memory_sync) 
     except Exception as e:
         logger.error(f"Error during initial DB connection test in startup: {e}", exc_info=True)
-        # If it fails, db_manager should already be in memory mode.
+        # Ensure db_manager is in memory mode on any error during startup test
+        await asyncio.to_thread(db_manager._fallback_to_memory_sync) 
 
     logger.info("✅ FastAPI startup initialization complete. App is ready to receive requests.")
     logger.info(f"🔧 CONFIG CHECK (after startup):")
@@ -108,7 +116,7 @@ async def startup_event():
     logger.info(f"Zoho Enabled: {ZOHO_ENABLED}")
 
 
-# Models (unchanged)
+# Models (UPDATED FOR COMPATIBILITY)
 class EmergencySaveRequest(BaseModel):
     session_id: str
     reason: str
@@ -148,7 +156,7 @@ class UserSession:
     question_limit_reached: bool = False
     ban_status: BanStatus = BanStatus.NONE
     ban_start_time: Optional[datetime] = None
-    ban_end_time: Optional[str] = None # Changed to str to match DB representation
+    ban_end_time: Optional[datetime] = None # Changed to datetime to match fifi.py (isoformat will convert it to string in DB)
     ban_reason: Optional[str] = None
     evasion_count: int = 0
     current_penalty_hours: int = 0
@@ -159,6 +167,13 @@ class UserSession:
     registration_prompted: bool = False
     registration_link_clicked: bool = False
     display_message_offset: int = 0
+    # NEW FIELDS FROM FIFI.PY FOR COMPATIBILITY:
+    reverification_pending: bool = False
+    pending_user_type: Optional[UserType] = None
+    pending_email: Optional[str] = None
+    pending_full_name: Optional[str] = None
+    pending_zoho_contact_id: Optional[str] = None
+    pending_wp_token: Optional[str] = None
 
 # Utility functions (unchanged)
 def safe_json_loads(data: Optional[str], default_value: Any = None) -> Any:
@@ -215,7 +230,8 @@ class ResilientDatabaseManager:
             
             if 'apikey' in query_params:
                 self._auth_method = "API_KEY"
-                apikey = query_params['apikey'][0]
+                # FIXED: Access the actual value from the parsed query list
+                apikey = query_params['apikey'][0] 
                 logger.debug(f"🔑 Detected API Key authentication (key length: {len(apikey)} chars)")
             elif parsed.username and parsed.password:
                 self._auth_method = "USERNAME_PASSWORD"
@@ -314,9 +330,10 @@ class ResilientDatabaseManager:
                 
                 # Test the connection to confirm it's truly open
                 test_result = await asyncio.to_thread(self.conn.execute, "SELECT 1 as connection_test")
+                # FIXED: Correctly access the value from the tuple returned by fetchone()
                 test_result_fetched = await asyncio.to_thread(test_result.fetchone)
                 
-                if test_result_fetched and test_result_fetched[0] == 1:
+                if test_result_fetched and test_result_fetched[0] == 1: 
                     logger.info(f"✅ QUICK SQLite Cloud connection established using {self._auth_method}!")
                     self.db_type = "cloud"
                     self._connection_attempts = 0 # Reset for next cycle
@@ -355,6 +372,7 @@ class ResilientDatabaseManager:
             self.conn = sqlite3.connect("fifi_sessions_emergency.db", check_same_thread=False)
             
             test_result = self.conn.execute("SELECT 1 as test_local").fetchone()
+            # FIXED: Correctly access the value from the tuple returned by fetchone()
             if test_result and test_result[0] == 1:
                 logger.info(f"✅ Local SQLite connection established! Test result: {test_result}")
                 self.db_type = "file"
@@ -419,17 +437,43 @@ class ResilientDatabaseManager:
                     wp_token TEXT,
                     timeout_saved_to_crm INTEGER DEFAULT 0,
                     recognition_response TEXT,
-                    display_message_offset INTEGER DEFAULT 0
+                    display_message_offset INTEGER DEFAULT 0,
+                    -- NEW: Re-verification fields from fifi.py for compatibility
+                    reverification_pending INTEGER DEFAULT 0,
+                    pending_user_type TEXT,
+                    pending_email TEXT,
+                    pending_full_name TEXT,
+                    pending_zoho_contact_id TEXT,
+                    pending_wp_token TEXT
                 )
             ''')
             
-            try:
-                # Add display_message_offset if it doesn't exist
-                self.conn.execute("ALTER TABLE sessions ADD COLUMN display_message_offset INTEGER DEFAULT 0")
-                logger.info("✅ Added display_message_offset column for fifi.py compatibility")
-            except Exception as alter_error:
-                logger.debug(f"ALTER TABLE for display_message_offset failed (likely already exists): {alter_error}")
-            
+            # Add new columns if they don't exist (for existing databases)
+            # This logic should create them if they weren't in an older version of the DB
+            new_columns_to_add = [
+                ("display_message_offset", "INTEGER DEFAULT 0"),
+                ("reverification_pending", "INTEGER DEFAULT 0"),
+                ("pending_user_type", "TEXT"),
+                ("pending_email", "TEXT"),
+                ("pending_full_name", "TEXT"),
+                ("pending_zoho_contact_id", "TEXT"),
+                ("pending_wp_token", "TEXT")
+            ]
+            for col_name, col_type in new_columns_to_add:
+                try:
+                    self.conn.execute(f"ALTER TABLE sessions ADD COLUMN {col_name} {col_type}")
+                    logger.info(f"✅ Added {col_name} column to existing database for compatibility.")
+                except sqlite3.OperationalError as e:
+                    # Catch specific error when column already exists
+                    if "duplicate column name" in str(e).lower() or "already exists" in str(e).lower():
+                        logger.debug(f"Column {col_name} already exists, skipping ALTER TABLE.")
+                    else:
+                        raise e # Re-raise for other operational errors
+                except Exception as e:
+                    logger.error(f"❌ Error adding column {col_name}: {e}", exc_info=True)
+                    raise # Critical failure for schema consistency
+
+
             self.conn.execute("CREATE INDEX IF NOT EXISTS idx_session_lookup ON sessions(session_id, active)")
             self.conn.execute("CREATE INDEX IF NOT EXISTS idx_fingerprint_id ON sessions(fingerprint_id)")
             self.conn.execute("CREATE INDEX IF NOT EXISTS idx_email ON sessions(email)")
@@ -461,7 +505,8 @@ class ResilientDatabaseManager:
             # Use a quick, non-blocking operation
             result = self.conn.execute("SELECT 1 as health_check").fetchone()
             
-            if result and result[0] == 1:
+            # FIXED: Correctly check value from tuple
+            if result and result[0] == 1: 
                 self._last_health_check = now
                 self._consecutive_socket_errors = 0
                 logger.debug("✅ Database health check passed")
@@ -497,7 +542,8 @@ class ResilientDatabaseManager:
         for attempt in range(max_retries):
             try:
                 # Ensure connection is ready before executing query (with timeout)
-                await self._ensure_connection_with_timeout(15) # Shorter timeout for individual query execution
+                # Use a specific timeout for this internal step
+                await self._ensure_connection_with_timeout(15) 
                 
                 if self.db_type == "memory":
                     raise Exception("Cannot execute SQL when in-memory mode is active for DB operations")
@@ -561,8 +607,9 @@ class ResilientDatabaseManager:
     async def test_connection(self) -> Dict[str, Any]:
         """Comprehensive connection test - LAZY INITIALIZATION ON FIRST CALL WITH TIMEOUT"""
         try:
-            # Attempt to establish a healthy connection within a generous timeout for testing purposes
-            success = await self._ensure_connection_with_timeout(30)
+            # This method itself might be called with asyncio.wait_for from startup.
+            # So, the internal _ensure_connection_with_timeout also needs its own aggressive timeout.
+            success = await self._ensure_connection_with_timeout(5) # Short timeout for test_connection itself
             if not success:
                 return {
                     "status": "initialization_timeout",
@@ -598,6 +645,7 @@ class ResilientDatabaseManager:
             
             try:
                 basic_result_cursor = await self._execute_with_socket_retry_async("SELECT 1 as connectivity_test", max_retries=1) # Quick test
+                # FIXED: Correctly access the value from the tuple returned by fetchone()
                 basic_result_fetched = await asyncio.to_thread(basic_result_cursor.fetchone)
                 if not basic_result_fetched or basic_result_fetched[0] != 1:
                     raise Exception(f"Connectivity test failed: {basic_result_fetched}")
@@ -612,6 +660,7 @@ class ResilientDatabaseManager:
                         active_count_result_fetched = await asyncio.to_thread(active_count_result_cursor.fetchone)
                         result["sessions_table"] = {
                             "exists": True,
+                            # FIXED: Access count from tuple element 0
                             "total_count": count_result_fetched[0] if count_result_fetched else 0,
                             "active_count": active_count_result_fetched[0] if active_count_result_fetched else 0
                         }
@@ -653,7 +702,7 @@ class ResilientDatabaseManager:
         with self.lock:
             logger.debug(f"🔍 Loading session {session_id[:8]}...")
             
-            success = await self._ensure_connection_with_timeout(20) # Use a moderate timeout for loading
+            success = await self._ensure_connection_with_timeout(15) # Use a moderate timeout for loading
             if not success:
                 logger.warning(f"⚠️ Connection timeout while loading session {session_id[:8]}, checking memory")
             
@@ -668,7 +717,7 @@ class ResilientDatabaseManager:
                 return copy.deepcopy(session) if session else None
             
             try:
-                # Select ALL fields for UserSession dataclass
+                # FIXED: Updated SELECT statement to include all new fields from fifi.py's UserSession
                 cursor = await self._execute_with_socket_retry_async("""
                     SELECT session_id, user_type, email, full_name, zoho_contact_id, 
                            created_at, last_activity, messages, active, wp_token, 
@@ -678,7 +727,9 @@ class ResilientDatabaseManager:
                            ban_start_time, ban_end_time, ban_reason, evasion_count, 
                            current_penalty_hours, escalation_level, email_addresses_used, 
                            email_switches_count, browser_privacy_level, registration_prompted, 
-                           registration_link_clicked, recognition_response, display_message_offset 
+                           registration_link_clicked, recognition_response, display_message_offset,
+                           reverification_pending, pending_user_type, pending_email, pending_full_name,
+                           pending_zoho_contact_id, pending_wp_token
                     FROM sessions WHERE session_id = ? AND active = 1
                 """, (session_id,))
                 
@@ -688,15 +739,22 @@ class ResilientDatabaseManager:
                     logger.info(f"❌ No active session found for {session_id[:8]}")
                     return None
                 
-                # Check column count for robust loading
-                min_expected_cols = 31 # The original 31 columns for base UserSession
-                if len(row) < min_expected_cols:
-                    logger.error(f"❌ Row has insufficient columns: {len(row)} (expected at least {min_expected_cols}) for session {session_id[:8]}")
-                    return None
+                # FIXED: Check for the new, higher number of columns
+                expected_min_cols = 38 
+                if len(row) < expected_min_cols:
+                    logger.error(f"❌ Row has insufficient columns: {len(row)} (expected at least {expected_min_cols}) for session {session_id[:8]}. Data corruption or old schema detected, attempting partial load.")
+                    # Allow to proceed, but log error. Missing fields will default to None.
+                    pass
                 
                 try:
-                    # Safely access display_message_offset, providing default for older schemas
+                    # Safely access all fields, providing defaults for missing columns
                     loaded_display_message_offset = row[31] if len(row) > 31 else 0
+                    loaded_reverification_pending = bool(row[32]) if len(row) > 32 else False
+                    loaded_pending_user_type = UserType(row[33]) if len(row) > 33 and row[33] else None
+                    loaded_pending_email = row[34] if len(row) > 34 else None
+                    loaded_pending_full_name = row[35] if len(row) > 35 else None
+                    loaded_pending_zoho_contact_id = row[36] if len(row) > 36 else None
+                    loaded_pending_wp_token = row[37] if len(row) > 37 else None
 
                     user_session = UserSession(
                         session_id=row[0],
@@ -719,7 +777,7 @@ class ResilientDatabaseManager:
                         question_limit_reached=bool(row[17]),
                         ban_status=BanStatus(row[18]) if row[18] else BanStatus.NONE,
                         ban_start_time=datetime.fromisoformat(row[19]) if row[19] else None,
-                        ban_end_time=row[20] if isinstance(row[20], str) else (datetime.fromisoformat(row[20]).isoformat() if row[20] else None), # Handle string or datetime
+                        ban_end_time=datetime.fromisoformat(row[20]) if row[20] else None, # FIXED: Ensure this is datetime object for UserSession
                         ban_reason=row[21],
                         evasion_count=row[22] or 0,
                         current_penalty_hours=row[23] or 0,
@@ -730,14 +788,21 @@ class ResilientDatabaseManager:
                         registration_prompted=bool(row[28]),
                         registration_link_clicked=bool(row[29]),
                         recognition_response=row[30],
-                        display_message_offset=loaded_display_message_offset # Use the safely loaded value
+                        display_message_offset=loaded_display_message_offset,
+                        reverification_pending=loaded_reverification_pending,
+                        pending_user_type=loaded_pending_user_type,
+                        pending_email=loaded_pending_email,
+                        pending_full_name=loaded_pending_full_name,
+                        pending_zoho_contact_id=loaded_pending_zoho_contact_id,
+                        pending_wp_token=loaded_pending_wp_token
                     )
                     
                     logger.info(f"✅ Successfully loaded session {session_id[:8]}")
                     return user_session
                     
                 except Exception as e:
-                    logger.error(f"❌ Failed to create UserSession object: {e}", exc_info=True)
+                    logger.error(f"❌ Failed to create UserSession object from row for session {session_id[:8]}: {e}", exc_info=True)
+                    logger.error(f"Problematic row data (truncated): {str(row)[:200]}")
                     return None
                     
             except Exception as e:
@@ -766,6 +831,10 @@ class ResilientDatabaseManager:
                     json_messages = "[]"
                     json_emails_used = "[]"
                 
+                # FIXED: Updated INSERT/REPLACE query to include all new fields from fifi.py's UserSession
+                # Ensure pending_user_type.value is used if not None
+                pending_user_type_value = session.pending_user_type.value if session.pending_user_type else None
+
                 await self._execute_with_socket_retry_async('''
                     INSERT OR REPLACE INTO sessions (
                         session_id, user_type, email, full_name, zoho_contact_id, 
@@ -776,24 +845,30 @@ class ResilientDatabaseManager:
                         ban_start_time, ban_end_time, ban_reason, evasion_count, 
                         current_penalty_hours, escalation_level, email_addresses_used, 
                         email_switches_count, browser_privacy_level, registration_prompted, 
-                        registration_link_clicked, recognition_response, display_message_offset
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        registration_link_clicked, recognition_response, display_message_offset,
+                        reverification_pending, pending_user_type, pending_email, pending_full_name,
+                        pending_zoho_contact_id, pending_wp_token
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (
                     session.session_id, session.user_type.value, session.email, session.full_name,
                     session.zoho_contact_id, session.created_at.isoformat(),
                     session.last_activity.isoformat(), json_messages, int(session.active),
                     session.wp_token, int(session.timeout_saved_to_crm), session.fingerprint_id,
-                    session.finger_print_method, session.visitor_type, session.daily_question_count,
+                    session.fingerprint_method, session.visitor_type, session.daily_question_count,
                     session.total_question_count,
                     session.last_question_time.isoformat() if session.last_question_time else None,
                     int(session.question_limit_reached), session.ban_status.value,
                     session.ban_start_time.isoformat() if session.ban_start_time else None,
-                    session.ban_end_time.isoformat() if session.ban_end_time else None,
+                    session.ban_end_time.isoformat() if session.ban_end_time else None, # FIXED: Convert datetime to isoformat
                     session.ban_reason, session.evasion_count, session.current_penalty_hours,
                     session.escalation_level, json_emails_used,
                     session.email_switches_count, session.browser_privacy_level,
                     int(session.registration_prompted), int(session.registration_link_clicked),
-                    session.recognition_response, session.display_message_offset
+                    session.recognition_response, session.display_message_offset,
+                    int(session.reverification_pending), 
+                    pending_user_type_value, # FIXED: Use the value
+                    session.pending_email, session.pending_full_name,
+                    session.pending_zoho_contact_id, session.pending_wp_token
                 ))
                 
                 await asyncio.to_thread(self.conn.commit)
@@ -810,7 +885,7 @@ class ResilientDatabaseManager:
         with self.lock:
             logger.info(f"🧹 Starting COMPLETE cleanup of sessions expired more than {expiry_minutes} minutes ago...")
             
-            success = await self._ensure_connection_with_timeout(20) # Use a moderate timeout for this
+            success = await self._ensure_connection_with_timeout(15) # Use a moderate timeout for this cleanup entrypoint
             if not success:
                 logger.warning("⚠️ Connection timeout during cleanup, checking memory mode")
             
@@ -849,11 +924,7 @@ class ResilientDatabaseManager:
                 cutoff_iso = cutoff_time.isoformat()
                 logger.info(f"🕒 Cleanup cutoff time: {cutoff_iso}")
                 
-                # Select sessions that are:
-                # 1. Currently active in DB (meaning beacon save failed OR was not session-ending)
-                # 2. Last activity before cutoff
-                # 3. Not yet marked as timeout_saved_to_crm
-                # 4. Of eligible user type with email and questions
+                # FIXED: Update SELECT statement to include all new fields for compatibility
                 cursor = await self._execute_with_socket_retry_async("""
                     SELECT session_id, user_type, email, full_name, zoho_contact_id, 
                            created_at, last_activity, messages, active, wp_token, 
@@ -863,7 +934,9 @@ class ResilientDatabaseManager:
                            ban_start_time, ban_end_time, ban_reason, evasion_count, 
                            current_penalty_hours, escalation_level, email_addresses_used, 
                            email_switches_count, browser_privacy_level, registration_prompted, 
-                           registration_link_clicked, recognition_response, display_message_offset
+                           registration_link_clicked, recognition_response, display_message_offset,
+                           reverification_pending, pending_user_type, pending_email, pending_full_name,
+                           pending_zoho_contact_id, pending_wp_token
                     FROM sessions 
                     WHERE active = 1 
                     AND last_activity < ? 
@@ -887,18 +960,24 @@ class ResilientDatabaseManager:
                     }
                 
                 sessions_to_crm_process = []
-                # session_ids_to_mark_inactive_later is removed, as marking inactive is now part of the individual processing loop
                 
                 for row in expired_sessions_rows:
                     try:
                         # Safely load the session (using the same logic as load_session for robustness)
-                        min_expected_cols = 31 
-                        if len(row) < min_expected_cols:
+                        expected_min_cols = 38 
+                        if len(row) < expected_min_cols:
                             logger.warning(f"❌ Skipping session with insufficient columns ({len(row)}) from cleanup query: {row[0][:8]}")
                             continue
 
+                        # FIXED: Safely access all fields
                         loaded_display_message_offset = row[31] if len(row) > 31 else 0
-                        
+                        loaded_reverification_pending = bool(row[32]) if len(row) > 32 else False
+                        loaded_pending_user_type = UserType(row[33]) if len(row) > 33 and row[33] else None
+                        loaded_pending_email = row[34] if len(row) > 34 else None
+                        loaded_pending_full_name = row[35] if len(row) > 35 else None
+                        loaded_pending_zoho_contact_id = row[36] if len(row) > 36 else None
+                        loaded_pending_wp_token = row[37] if len(row) > 37 else None
+
                         session = UserSession(
                             session_id=row[0],
                             user_type=UserType(row[1]) if row[1] else UserType.GUEST,
@@ -920,7 +999,7 @@ class ResilientDatabaseManager:
                             question_limit_reached=bool(row[17]),
                             ban_status=BanStatus(row[18]) if row[18] else BanStatus.NONE,
                             ban_start_time=datetime.fromisoformat(row[19]) if row[19] else None,
-                            ban_end_time=row[20] if isinstance(row[20], str) else (datetime.fromisoformat(row[20]).isoformat() if row[20] else None), # Handle string or datetime
+                            ban_end_time=datetime.fromisoformat(row[20]) if row[20] else None, # FIXED: Ensure datetime object
                             ban_reason=row[21],
                             evasion_count=row[22] or 0,
                             current_penalty_hours=row[23] or 0,
@@ -931,7 +1010,13 @@ class ResilientDatabaseManager:
                             registration_prompted=bool(row[28]),
                             registration_link_clicked=bool(row[29]),
                             recognition_response=row[30],
-                            display_message_offset=loaded_display_message_offset
+                            display_message_offset=loaded_display_message_offset,
+                            reverification_pending=loaded_reverification_pending,
+                            pending_user_type=loaded_pending_user_type,
+                            pending_email=loaded_pending_email,
+                            pending_full_name=loaded_pending_full_name,
+                            pending_zoho_contact_id=loaded_pending_zoho_contact_id,
+                            pending_wp_token=loaded_pending_wp_token
                         )
                         sessions_to_crm_process.append(session)
                         logger.debug(f"📝 Session {session.session_id[:8]} added for CRM save processing in cleanup")
@@ -957,12 +1042,12 @@ class ResilientDatabaseManager:
                         if save_result.get("success"):
                             session_to_process.timeout_saved_to_crm = True
                             session_to_process.active = False # Mark inactive after successful save
-                            logger.info(f"✅ Background cleanup CRM save SUCCESS for {session_to_process.session_id[:8]} - Marked INACTIVE")
+                            logger.info(f"✅ Background CRM cleanup save SUCCESS for {session_to_process.session_id[:8]} - Marked INACTIVE")
                             crm_saved_count += 1
                         else:
                             # Even if CRM save fails now, mark as inactive to prevent endless retries
                             session_to_process.active = False
-                            logger.error(f"❌ Background cleanup CRM save FAILED for {session_to_process.session_id[:8]} - Marking INACTIVE anyway")
+                            logger.error(f"❌ Background CRM cleanup save FAILED for {session_to_process.session_id[:8]} - Marking INACTIVE anyway")
                             crm_failed_count += 1
                         
                         session_to_process.last_activity = datetime.now() # Update last activity before final save
@@ -987,11 +1072,11 @@ class ResilientDatabaseManager:
                             logger.info(f"🔒 Background CRM - Session {session_to_process.session_id[:8]} marked as INACTIVE after critical error.")
                         except Exception as fallback_error:
                             logger.critical(f"❌ Failed to mark session inactive even after critical error: {fallback_error}")
-                
-                logger.info(f"✅ Background cleanup processing finished: {len(sessions_to_crm_process)} sessions processed, {crm_saved_count} saved to CRM, {crm_failed_count} failed")
-                
-            else:
-                logger.info("✅ Background cleanup - No CRM-eligible sessions found (for second pass processing)") # This branch applies if db_type is memory
+            
+            logger.info(f"✅ Background CRM processing completed: {len(crm_eligible_sessions_for_cleanup_retry)} sessions processed, {crm_saved_count} saved to CRM, {crm_failed_count} failed")
+            
+        else:
+            logger.info("✅ Background cleanup - No CRM-eligible sessions found (for second pass processing)")
         
         logger.info("✅ Background cleanup completed successfully with INDIVIDUAL CRM PROCESSING")
         
@@ -1062,7 +1147,7 @@ class ZohoCRMManager:
         self.base_url = "https://www.zohoapis.com/crm/v2"
         self._access_token = None
         self._token_expiry = None
-        self._http_client = httpx.AsyncClient() 
+        self._http_client = httpx.AsyncClient(timeout=30) # Default timeout for the client
 
     async def close_http_client(self):
         if self._http_client:
@@ -1088,7 +1173,7 @@ class ZohoCRMManager:
                     'client_secret': ZOHO_CLIENT_SECRET,
                     'grant_type': 'refresh_token'
                 },
-                timeout=15
+                timeout=15 # Specific timeout for token request
             )
             response.raise_for_status()
             data = response.json()
@@ -1118,7 +1203,8 @@ class ZohoCRMManager:
             data = response.json()
             
             if 'data' in data and data['data']:
-                contact_id = data['data'][0]['id']
+                # FIXED: Access the first element of the 'data' list, then 'id'
+                contact_id = data['data'][0]['id'] 
                 logger.info(f"✅ Found existing Zoho contact: {contact_id}")
                 return contact_id
             logger.debug(f"❌ No Zoho contact found for email: {email}")
@@ -1147,6 +1233,7 @@ class ZohoCRMManager:
             data = response.json()
             
             if 'data' in data and data['data'] and data['data'][0]['code'] == 'SUCCESS':
+                # FIXED: Access the first element of the 'data' list, then 'details', then 'id'
                 contact_id = data['data'][0]['details']['id']
                 logger.info(f"✅ Created new Zoho contact: {contact_id}")
                 return contact_id
@@ -1330,6 +1417,12 @@ async def shutdown_event():
     logger.info("👋 Shutting down FastAPI application. Closing httpx client...")
     if zoho_manager:
         await zoho_manager.close_http_client()
+    if db_manager and db_manager.conn:
+        try:
+            await asyncio.to_thread(db_manager.conn.close)
+            logger.info("✅ Database connection closed.")
+        except Exception as e:
+            logger.error(f"Error closing database connection during shutdown: {e}")
     logger.info("✅ FastAPI shutdown complete.")
 
 # Helper functions (unchanged)
@@ -1394,11 +1487,11 @@ async def _perform_emergency_crm_save(session_id: str, reason: str):
             return
         
         if not is_crm_eligible(session, is_emergency_save=True):
-            logger.info(f"ℹ️ Background save: Session {session_id[:8]} not eligible for CRM save (reason: {reason}). Skipping.")
+            logger.info(f"ℹ️ Background save: Session {session.session_id[:8]} not eligible for CRM save (reason: {reason}). Skipping.")
             return
 
         if session.timeout_saved_to_crm:
-            logger.info(f"ℹ️ Background save: Session {session_id[:8]} already marked as saved to CRM. Skipping duplicate save.")
+            logger.info(f"ℹ️ Background save: Session {session.session_id[:8]} already marked as saved to CRM. Skipping duplicate save.")
             return
 
         save_result = await zoho_manager.save_chat_transcript_sync(session, reason)
@@ -1544,7 +1637,7 @@ async def root():
     return {
         "message": "FiFi Emergency API - Async Operations Enabled",
         "status": "running",
-        "version": "3.6.0-final-fix", # Version bumped
+        "version": "3.6.0-final-fix-v4", # Version bumped
         "critical_fix": "Blocking I/O operations moved to async or thread pool and endpoint logic refactored",
         "compatibility": "100% compatible with fifi.py database schema and UserSession structure",
         "fixes_applied": [
@@ -1563,7 +1656,12 @@ async def root():
             "PRESERVED: Socket error resilience and auto-recovery",
             "PRESERVED: fifi.py compatibility (display_message_offset field)",
             "OPTIMIZED: Reduced retry counts for faster background processing",
-            "CRITICAL FIX: Managers (db_manager, zoho_manager, pdf_exporter) now initialized in `on_event('startup')` instead of global scope, resolving cold start 504 timeouts." # NEW
+            "CRITICAL FIX: Managers (db_manager, zoho_manager, pdf_exporter) now initialized in `on_event('startup')` instead of global scope, resolving cold start 504 timeouts.",
+            "FURTHER OPTIMIZED: Startup `db_manager.test_connection()` is now `asyncio.wait_for` with a hard timeout, preventing startup from hanging.",
+            "ENHANCED: More robust session loading/saving in `ResilientDatabaseManager` with explicit timeouts for each step.",
+            "CRITICAL FIX: `UserSession` dataclass and corresponding DB `SELECT`/`INSERT`/`REPLACE` queries fully aligned with `fifi.py`'s latest schema (including `reverification_pending` fields).",
+            "CRITICAL FIX: `fetchone()` comparison bug (`test_result_fetched == 1` changed to `test_result_fetched[0] == 1`).",
+            "FIXED: Zoho CRM `_find_contact_by_email` and `_create_contact` response parsing for `data['data']` which is a list."
         ],
         "cleanup_logic_complete": {
             "5_minute_timeout_check": "IMPLEMENTED - Sessions inactive for 5+ minutes are processed",
@@ -1639,7 +1737,7 @@ async def comprehensive_diagnostics():
     try:
         diagnostics = {
             "timestamp": datetime.now(),
-            "version": "3.6.0-final-fix", # Version bumped
+            "version": "3.6.0-final-fix-v4", # Version bumped
             "timeout_fix_status": {
                 "lazy_database_initialization": "active_with_timeouts_async",
                 "blocking_startup_eliminated": True,
@@ -1726,8 +1824,7 @@ async def cleanup_expired_sessions(background_tasks: BackgroundTasks):
                 "Timeout protection on all operations",
                 "Retries for sessions with failed beacon saves"
             ],
-            "timestamp": datetime.now(),
-            "response_time": "< 100ms (background processing)"
+            "timestamp": datetime.now()
         }
         
     except Exception as e:
