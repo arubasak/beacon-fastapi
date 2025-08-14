@@ -17,7 +17,7 @@ from collections import defaultdict
 import io
 import html
 import re
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.platypus import SimpleDocDocument, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.colors import lightgrey
@@ -1072,25 +1072,22 @@ class ResilientDatabaseManager:
                             logger.info(f"🔒 Background CRM - Session {session_to_process.session_id[:8]} marked as INACTIVE after critical error.")
                         except Exception as fallback_error:
                             logger.critical(f"❌ Failed to mark session inactive even after critical error: {fallback_error}")
-            
-            logger.info(f"✅ Background CRM processing completed: {len(crm_eligible_sessions_for_cleanup_retry)} sessions processed, {crm_saved_count} saved to CRM, {crm_failed_count} failed")
-            
-        else:
-            logger.info("✅ Background cleanup - No CRM-eligible sessions found (for second pass processing)")
-        
-        logger.info("✅ Background cleanup completed successfully with INDIVIDUAL CRM PROCESSING")
-        
-        return {
-            "success": True,
-            "cleaned_up_count": len(sessions_to_crm_process),
-            "crm_eligible_count": len(sessions_to_crm_process), # Corrected as all were eligible and processed
-            "rows_affected_inactive": crm_saved_count + crm_failed_count, # Number of sessions whose status we tried to finalize
-            "storage_type": self.db_type,
-            "crm_saved_count": crm_saved_count,
-            "crm_failed_count": crm_failed_count,
-            "cutoff_time": cutoff_iso if 'cutoff_iso' in locals() else 'N/A'
-        }
                 
+                logger.info(f"✅ Background CRM processing completed: {len(sessions_to_crm_process)} sessions processed, {crm_saved_count} saved to CRM, {crm_failed_count} failed")
+                
+                logger.info("✅ Background cleanup completed successfully with INDIVIDUAL CRM PROCESSING")
+                
+                return {
+                    "success": True,
+                    "cleaned_up_count": len(sessions_to_crm_process),
+                    "crm_eligible_count": len(sessions_to_crm_process), # Corrected as all were eligible and processed
+                    "rows_affected_inactive": crm_saved_count + crm_failed_count, # Number of sessions whose status we tried to finalize
+                    "storage_type": self.db_type,
+                    "crm_saved_count": crm_saved_count,
+                    "crm_failed_count": crm_failed_count,
+                    "cutoff_time": cutoff_iso
+                }
+                        
             except Exception as e:
                 logger.error(f"❌ Failed to cleanup expired sessions: {e}", exc_info=True)
                 return {
@@ -1565,68 +1562,6 @@ async def _perform_full_cleanup_in_background():
             return
         
         logger.info(f"✅ Background cleanup - Successfully processed {cleanup_result.get('cleaned_up_count', 0)} expired sessions")
-        logger.info(f"📝 Background cleanup - Found {cleanup_result.get('crm_eligible_count', 0)} sessions to attempt CRM save for (these were active=1, expired, not saved).")
-        
-        crm_eligible_sessions_for_cleanup_retry = cleanup_result.get('crm_eligible_sessions', [])
-        
-        if crm_eligible_sessions_for_cleanup_retry:
-            logger.info(f"🔄 Background cleanup - Starting INDIVIDUAL CRM processing for {len(crm_eligible_sessions_for_cleanup_retry)} sessions...")
-            
-            crm_saved_count = 0
-            crm_failed_count = 0
-            
-            for session_data_from_db in crm_eligible_sessions_for_cleanup_retry:
-                try:
-                    # session_data_from_db is already a UserSession object loaded by db_manager.cleanup_expired_sessions
-                    # It's an active session from DB (active=1), but expired and unsaved
-                    
-                    logger.info(f"🔄 Background CRM processing session {session_data_from_db.session_id[:8]} - Email: {session_data_from_db.email}, Type: {session_data_from_db.user_type.value}, Questions: {session_data_from_db.daily_question_count}, Messages: {len(session_data_from_db.messages)}")
-                    
-                    # Attempt to save to CRM (this is the "retry" attempt)
-                    save_result = await zoho_manager.save_chat_transcript_sync(session_data_from_db, "Automated Session Timeout Cleanup")
-                    
-                    # Regardless of CRM save success, this session needs to be marked inactive now.
-                    # It was active=1 in DB, and now it's processed by cleanup.
-                    
-                    if save_result.get("success"):
-                        session_data_from_db.timeout_saved_to_crm = True
-                        session_data_from_db.active = False # Mark inactive after successful save
-                        logger.info(f"✅ Background CRM cleanup save SUCCESS for {session_data_from_db.session_id[:8]} - Marked INACTIVE")
-                        crm_saved_count += 1
-                    else:
-                        session_data_from_db.active = False # Mark inactive even if CRM save failed (final attempt for this cleanup run)
-                        logger.error(f"❌ Background CRM cleanup save FAILED for {session_data_from_db.session_id[:8]} - Marking INACTIVE anyway")
-                        crm_failed_count += 1
-                    
-                    session_data_from_db.last_activity = datetime.now() # Update last activity before final save
-                    
-                    # If Zoho returned a contact_id and it's not already set in session, update it
-                    if save_result.get("contact_id") and not session_data_from_db.zoho_contact_id:
-                        session_data_from_db.zoho_contact_id = save_result["contact_id"]
-                        logger.info(f"🔗 Background CRM - Saved contact ID {save_result['contact_id']} to session {session_data_from_db.session_id[:8]}.")
-
-                    await db_manager.save_session(session_data_from_db) # Save final state (active=0)
-                    
-                    logger.info(f"📊 Cleanup Session State Final: {session_data_from_db.session_id[:8]} - Active: {session_data_from_db.active}, Saved: {session_data_from_db.timeout_saved_to_crm}, Contact: {session_data_from_db.zoho_contact_id}")
-                    
-                except Exception as e:
-                    crm_failed_count += 1
-                    logger.critical(f"❌ Critical error in background CRM processing for session {session_data_from_db.session_id[:8]}: {e}", exc_info=True)
-                    # Ensure session is marked inactive even on critical processing error
-                    try:
-                        session_data_from_db.active = False
-                        session_data_from_db.last_activity = datetime.now()
-                        await db_manager.save_session(session_data_from_db)
-                        logger.info(f"🔒 Background CRM - Session {session_data_from_db.session_id[:8]} marked as INACTIVE after critical error.")
-                    except Exception as fallback_error:
-                        logger.critical(f"❌ Failed to mark session inactive even after critical error: {fallback_error}")
-            
-            logger.info(f"✅ Background CRM processing completed: {len(crm_eligible_sessions_for_cleanup_retry)} sessions processed, {crm_saved_count} saved to CRM, {crm_failed_count} failed")
-            
-        else:
-            logger.info("✅ Background cleanup - No CRM-eligible sessions found (for second pass processing)")
-        
-        logger.info("✅ Background cleanup completed successfully with INDIVIDUAL CRM PROCESSING")
         
     except Exception as e:
         logger.critical(f"❌ Critical error in background cleanup: {e}", exc_info=True)
@@ -1661,7 +1596,8 @@ async def root():
             "ENHANCED: More robust session loading/saving in `ResilientDatabaseManager` with explicit timeouts for each step.",
             "CRITICAL FIX: `UserSession` dataclass and corresponding DB `SELECT`/`INSERT`/`REPLACE` queries fully aligned with `fifi.py`'s latest schema (including `reverification_pending` fields).",
             "CRITICAL FIX: `fetchone()` comparison bug (`test_result_fetched == 1` changed to `test_result_fetched[0] == 1`).",
-            "FIXED: Zoho CRM `_find_contact_by_email` and `_create_contact` response parsing for `data['data']` which is a list."
+            "FIXED: Zoho CRM `_find_contact_by_email` and `_create_contact` response parsing for `data['data']` which is a list.",
+            "SYNTAX ERROR FIX: Fixed orphaned except block in cleanup_expired_sessions method"
         ],
         "cleanup_logic_complete": {
             "5_minute_timeout_check": "IMPLEMENTED - Sessions inactive for 5+ minutes are processed",
