@@ -104,7 +104,7 @@ class EmergencySaveRequest(BaseModel):
 class UserType(Enum):
     GUEST = "guest"
     EMAIL_VERIFIED_GUEST = "email_verified_guest"
-    REGISTERED_USER = "registered_user"
+    REGISTERED_USER = "registered_user" # Reverted to registered_user for consistency
 
 class BanStatus(Enum):
     NONE = "none"
@@ -182,7 +182,7 @@ class ResilientDatabaseManager:
         self.db_type = "memory"
         self.local_sessions = {}
         self._initialized_schema = False
-        self._initialization_attempted_in_session = False
+        self._initialization_attempted_in_session = False # Correctly initialized
 
         logger.info("🔄 ResilientDatabaseManager initialized (LAZY ASYNC)")
         if connection_string: self._analyze_connection_string()
@@ -225,8 +225,10 @@ class ResilientDatabaseManager:
         # Close existing connection if any
         if self.conn:
             logger.warning("⚠️ Existing connection unhealthy. Closing.")
-            try: await asyncio.to_thread(self.conn.close)
-            except Exception as e: logger.debug(f"⚠️ Error closing old DB connection: {e}")
+            try: 
+                await asyncio.to_thread(self.conn.close)
+            except Exception as e: 
+                logger.debug(f"⚠️ Error closing old DB connection: {e}")
             self.conn = None; self.db_type = "memory"; self._initialized_schema = False
 
         cloud_conn_successful = False
@@ -269,7 +271,12 @@ class ResilientDatabaseManager:
             if max_wait_seconds <= 0: logger.warning("⏰ No time left for cloud connection attempts"); return
             try:
                 logger.info(f"🔄 QUICK SQLite Cloud connection attempt {attempt + 1}/{max_attempts}")
-                if self.conn: await asyncio.to_thread(self.conn.close); self.conn = None
+                if self.conn: 
+                    try: 
+                        await asyncio.to_thread(self.conn.close)
+                    except: 
+                        pass
+                    self.conn = None
                 
                 self.conn = await asyncio.to_thread(sqlitecloud.connect, self.connection_string)
                 test_result = await asyncio.to_thread(self.conn.execute, "SELECT 1 as connection_test")
@@ -282,7 +289,12 @@ class ResilientDatabaseManager:
                 else: raise Exception(f"Connection test failed - unexpected result: {fetched_value}")
             except Exception as e:
                 logger.error(f"❌ QUICK SQLite Cloud connection attempt {attempt + 1} failed: {e}")
-                if self.conn: await asyncio.to_thread(self.conn.close); self.conn = None
+                if self.conn: 
+                    try: 
+                        await asyncio.to_thread(self.conn.close)
+                    except: 
+                        pass
+                    self.conn = None
                 if attempt < max_attempts - 1 and max_wait_seconds > 0.5: await asyncio.sleep(min(2, max_wait_seconds / (max_attempts - attempt)))
         logger.error(f"❌ All {max_attempts} QUICK SQLite Cloud connection attempts failed")
         self.db_type = "memory"
@@ -301,8 +313,11 @@ class ResilientDatabaseManager:
             self._fallback_to_memory_sync()
 
     def _fallback_to_memory_sync(self):
-        if self.conn: try: self.conn.close()
-        except: pass
+        if self.conn: 
+            try: 
+                self.conn.close()
+            except: 
+                pass
         self.conn = None; self.db_type = "memory"; self.local_sessions = {}; self._initialized_schema = True
         logger.warning("⚠️ Operating in in-memory mode due to connection issues")
 
@@ -409,7 +424,6 @@ class ResilientDatabaseManager:
             if self.db_type == "memory":
                 session = self.local_sessions.get(session_id); return copy.deepcopy(session) if session else None
             try:
-                # Select all 38 columns as per UserSession dataclass
                 cursor = await self._execute_with_socket_retry_async("SELECT session_id, user_type, email, full_name, zoho_contact_id, created_at, last_activity, messages, active, wp_token, timeout_saved_to_crm, fingerprint_id, fingerprint_method, visitor_type, daily_question_count, total_question_count, last_question_time, question_limit_reached, ban_status, ban_start_time, ban_end_time, ban_reason, evasion_count, current_penalty_hours, escalation_level, email_addresses_used, email_switches_count, browser_privacy_level, registration_prompted, registration_link_clicked, recognition_response, display_message_offset, reverification_pending, pending_user_type, pending_email, pending_full_name, pending_zoho_contact_id, pending_wp_token FROM sessions WHERE session_id = ? AND active = 1", (session_id,))
                 row = await asyncio.to_thread(cursor.fetchone)
                 if not row: return None
@@ -420,7 +434,7 @@ class ResilientDatabaseManager:
                     "email": row[2], "full_name": row[3], "zoho_contact_id": row[4],
                     "created_at": datetime.fromisoformat(row[5]) if row[5] else datetime.now(),
                     "last_activity": datetime.fromisoformat(row[6]) if row[6] else datetime.now(),
-                    "messages": safe_json_loads(row[7], []), "active": bool(row[8]), "wp_token": row[9],
+                    "messages": safe_json_loads(row[7]), "active": bool(row[8]), "wp_token": row[9],
                     "timeout_saved_to_crm": bool(row[10]), "fingerprint_id": row[11],
                     "fingerprint_method": row[12], "visitor_type": row[13] or 'new_visitor',
                     "daily_question_count": row[14] or 0, "total_question_count": row[15] or 0,
@@ -430,7 +444,7 @@ class ResilientDatabaseManager:
                     "ban_end_time": datetime.fromisoformat(row[20]) if row[20] else None,
                     "ban_reason": row[21], "evasion_count": row[22] or 0,
                     "current_penalty_hours": row[23] or 0, "escalation_level": row[24] or 0,
-                    "email_addresses_used": safe_json_loads(row[25], []), "email_switches_count": row[26] or 0,
+                    "email_addresses_used": safe_json_loads(row[25]), "email_switches_count": row[26] or 0,
                     "browser_privacy_level": row[27], "registration_prompted": bool(row[28]),
                     "registration_link_clicked": bool(row[29]), "recognition_response": row[30],
                     "display_message_offset": row[31] if len(row) > 31 else 0,
@@ -485,7 +499,7 @@ class ResilientDatabaseManager:
     async def cleanup_expired_sessions(self, expiry_minutes: int = 5, limit: int = 5) -> Dict[str, Any]: # Default limit reduced to 5
         with self.lock:
             logger.info(f"🧹 Starting cleanup for sessions expired >{expiry_minutes}m, LIMIT {limit} per run.")
-            if not await self._ensure_connection(15): logger.warning("⚠️ Conn timeout for cleanup.");
+            if not await self._ensure_connection(15): logger.warning(f"⚠️ Conn timeout for cleanup.");
             
             if self.db_type == "memory":
                 cutoff_time = datetime.now() - timedelta(minutes=expiry_minutes)
@@ -517,7 +531,6 @@ class ResilientDatabaseManager:
                 for row in sessions_to_process:
                     await asyncio.sleep(0) # Yield control
                     try:
-                        # Reconstruct UserSession object for processing
                         session_obj = UserSession(session_id=row[0], user_type=UserType(row[1]), email=row[2], full_name=row[3], zoho_contact_id=row[4],
                             created_at=datetime.fromisoformat(row[5]), last_activity=datetime.fromisoformat(row[6]), messages=safe_json_loads(row[7]),
                             active=bool(row[8]), wp_token=row[9], timeout_saved_to_crm=bool(row[10]), fingerprint_id=row[11],
@@ -609,45 +622,49 @@ class ZohoCRMManager:
         except Exception as e: logger.error(f"❌ Failed to get Zoho access token: {e}", exc_info=True); return None
 
     async def _find_contact_by_email(self, email: str) -> Optional[str]:
-        token = await self._get_access_token(); return None if not token else (await self._perform_zoho_get("Contacts/search", {'criteria': f'(Email:equals:{email})'}, token, "find contact"))
-
-    async def _create_contact(self, email: str, full_name: Optional[str]) -> Optional[str]:
-        token = await self._get_access_token(); return None if not token else (await self._perform_zoho_post("Contacts", {"data": [{"Last_Name": full_name or "Food Professional", "Email": email, "Lead_Source": "FiFi AI Emergency API"}]}, token, "create contact"))
-
-    async def _add_note(self, contact_id: str, note_title: str, note_content: str) -> bool:
-        token = await self._get_access_token(); return False if not token else (await self._perform_zoho_post("Notes", {"data": [{"Note_Title": note_title, "Note_Content": note_content[:32000], "Parent_Id": contact_id, "se_module": "Contacts"}]}, token, "add note"))
-
-    async def _upload_attachment(self, contact_id: str, pdf_buffer: io.BytesIO, filename: str) -> bool:
-        token = await self._get_access_token(); return False if not token else (await self._perform_zoho_upload(contact_id, pdf_buffer, filename, token))
-
-    async def _perform_zoho_get(self, endpoint: str, params: Dict[str, Any], token: str, op_name: str, timeout: int = 10):
+        token = await self._get_access_token()
+        if not token: return None
         try:
             headers = {'Authorization': f'Zoho-oauthtoken {token}'}
-            response = await self._http_client.get(f"{self.base_url}/{endpoint}", headers=headers, params=params, timeout=timeout)
+            response = await self._http_client.get(f"{self.base_url}/Contacts/search", headers=headers, params={'criteria': f'(Email:equals:{email})'}, timeout=10)
             response.raise_for_status()
             data = response.json(); return data['data'][0]['id'] if 'data' in data and data['data'] else None
-        except Exception as e: logger.error(f"❌ Error {op_name} Zoho: {e}", exc_info=True); return None
+        except Exception as e: logger.error(f"❌ Error finding contact {email}: {e}", exc_info=True); return None
             
-    async def _perform_zoho_post(self, endpoint: str, json_data: Dict[str, Any], token: str, op_name: str, timeout: int = 10):
+    async def _create_contact(self, email: str, full_name: Optional[str]) -> Optional[str]:
+        token = await self._get_access_token()
+        if not token: return None
         try:
             headers = {'Authorization': f'Zoho-oauthtoken {token}', 'Content-Type': 'application/json'}
-            response = await self._http_client.post(f"{self.base_url}/{endpoint}", headers=headers, json=json_data, timeout=timeout)
+            response = await self._http_client.post(f"{self.base_url}/Contacts", headers=headers, json={"data": [{"Last_Name": full_name or "Food Professional", "Email": email, "Lead_Source": "FiFi AI Emergency API"}]}, timeout=10)
+            response.raise_for_status()
+            data = response.json(); return data['data'][0]['details']['id'] if 'data' in data and data['data'] and data['data'][0]['code'] == 'SUCCESS' else None
+        except Exception as e: logger.error(f"❌ Error creating contact {email}: {e}", exc_info=True); return None
+
+    async def _add_note(self, contact_id: str, note_title: str, note_content: str) -> bool:
+        token = await self._get_access_token()
+        if not token: return False
+        if len(note_content) > 32000: note_content = note_content[:32000 - 100] + "\n\n[Content truncated due to size limits]"
+        try:
+            headers = {'Authorization': f'Zoho-oauthtoken {token}', 'Content-Type': 'application/json'}
+            response = await self._http_client.post(f"{self.base_url}/Notes", headers=headers, json={"data": [{"Note_Title": note_title, "Note_Content": note_content, "Parent_Id": contact_id, "se_module": "Contacts"}]}, timeout=15)
             response.raise_for_status()
             return 'data' in response.json() and response.json()['data'][0]['code'] == 'SUCCESS'
-        except Exception as e: logger.error(f"❌ Error {op_name} Zoho: {e}", exc_info=True); return False
+        except Exception as e: logger.error(f"❌ Error adding note '{note_title}': {e}", exc_info=True); return False
 
-    async def _perform_zoho_upload(self, contact_id: str, pdf_buffer: io.BytesIO, filename: str, token: str, max_retries: int = 2):
+    async def _upload_attachment(self, contact_id: str, pdf_buffer: io.BytesIO, filename: str) -> bool:
+        token = await self._get_access_token()
+        if not token: return False
         upload_url = f"{self.base_url}/Contacts/{contact_id}/Attachments"
-        for attempt in range(max_retries):
+        for attempt in range(2):
             try:
-                headers = {'Authorization': f'Zoho-oauthtoken {token}'}
                 pdf_buffer.seek(0); pdf_content = await asyncio.to_thread(pdf_buffer.read)
-                response = await self._http_client.post(upload_url, headers=headers, files={'file': (filename, pdf_content, 'application/pdf')}, timeout=60)
-                if response.status_code == 401: token = await self._get_access_token(force_refresh=True); continue # Token refresh on 401
+                response = await self._http_client.post(upload_url, headers={'Authorization': f'Zoho-oauthtoken {token}'}, files={'file': (filename, pdf_content, 'application/pdf')}, timeout=60)
+                if response.status_code == 401: token = await self._get_access_token(force_refresh=True); continue
                 response.raise_for_status()
                 return 'data' in response.json() and response.json()['data'][0]['code'] == 'SUCCESS'
-            except Exception as e: logger.error(f"❌ Error uploading Zoho attachment (attempt {attempt + 1}/{max_retries}): {e}", exc_info=True);
-            if attempt < max_retries - 1: await asyncio.sleep(2 ** attempt)
+            except Exception as e: logger.error(f"❌ Error uploading attachment (attempt {attempt + 1}/2): {e}", exc_info=True)
+            if attempt < 1: await asyncio.sleep(2 ** attempt)
         return False
 
     async def save_chat_transcript_sync(self, session: UserSession, trigger_reason: str) -> Dict[str, Any]:
@@ -688,7 +705,7 @@ async def _perform_emergency_crm_save(session_id: str, reason: str):
         
         save_result = await zoho_manager.save_chat_transcript_sync(session, reason)
         session.timeout_saved_to_crm = save_result.get("success", False)
-        if is_session_ending_reason(reason) or not save_result.get("success"): session.active = False # Force inactive on session-ending reason OR CRM save failure
+        if is_session_ending_reason(reason) or not save_result.get("success"): session.active = False
         session.last_activity = datetime.now()
         if save_result.get("contact_id") and not session.zoho_contact_id: session.zoho_contact_id = save_result["contact_id"]
         await db_manager.save_session(session)
@@ -697,7 +714,7 @@ async def _perform_emergency_crm_save(session_id: str, reason: str):
 async def _perform_full_cleanup_in_background():
     if db_manager is None or zoho_manager is None: logger.critical("❌ Managers not initialized for full cleanup task."); return
     try:
-        cleanup_result = await db_manager.cleanup_expired_sessions(expiry_minutes=5, limit=5) # Reduced default limit to 5
+        cleanup_result = await db_manager.cleanup_expired_sessions(expiry_minutes=5, limit=5) # Default limit reduced to 5
         if not cleanup_result.get("success"): logger.error(f"❌ Background cleanup - Database cleanup failed: {cleanup_result}"); return
     except Exception as e: logger.critical(f"❌ Critical error in background cleanup: {e}", exc_info=True)
 
