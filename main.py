@@ -257,7 +257,7 @@ class ResilientDatabaseManager:
                 try:
                     await asyncio.to_thread(self._init_complete_database_sync) # Ensure schema exists if not yet
                     self._initialized_schema = True
-                    logger.info("✅ Ensured schema initialized on reuse..")
+                    logger.info("✅ Ensured schema initialized on reuse.")
                 except Exception as e:
                     logger.error(f"❌ Schema check on reuse failed: {e}. Forcing re-connection.", exc_info=True)
                     self.conn = None # Invalidate so it tries to re-connect
@@ -300,20 +300,27 @@ class ResilientDatabaseManager:
         cloud_connection_successful = False
         if self.connection_string and SQLITECLOUD_AVAILABLE:
             try:
-                # ADOPTED FROM FIFI.PY: Removed 'timeout' argument from sqlitecloud.connect
-                self.conn = await asyncio.to_thread(sqlitecloud.connect, self.connection_string)
-                
+                await self._attempt_quick_cloud_connection_async(max_wait_seconds - (datetime.now() - start_time).total_seconds())
                 if self.conn and self.db_type == "cloud":
                     cloud_connection_successful = True
+                else:
+                    # Explicitly log if _attempt_quick_cloud_connection_async finished but didn't result in 'cloud' db_type
+                    logger.error(f"❌ SQLite Cloud connection attempt finished, but db_type is '{self.db_type}' (expected 'cloud'). Connection string might be invalid or other issue. Debugging further...")
             except Exception as e:
-                logger.debug(f"Cloud connection attempt failed in _ensure_connection: {e}")
+                # Change from debug to error here to make it visible
+                logger.error(f"❌ SQLite Cloud connection attempt failed in _ensure_connection (caught exception): {e}", exc_info=True)
                 self.conn = None # Ensure connection is reset on failure here too
                 self.db_type = "memory" # Ensure db_type is memory if cloud fails
+        else:
+            logger.info(f"ℹ️ Skipping SQLite Cloud connection attempt. Connection string set: {bool(self.connection_string)}, SDK available: {SQLITECLOUD_AVAILABLE}.")
+
 
         # Fallback to local SQLite if cloud failed or not configured, and still no persistent connection
         if not cloud_connection_successful: # Only try local if cloud wasn't successful
             logger.info("☁️ Cloud connection failed/unavailable, trying local SQLite...")
             await asyncio.to_thread(self._attempt_local_connection_sync) # This sets self.conn and self.db_type
+            if self.db_type != "file":
+                 logger.error("❌ Local SQLite fallback connection also failed. Defaulting to in-memory.")
 
         # If a non-memory connection is now established (either cloud or local), ensure schema is initialized
         if self.conn and self.db_type != "memory":
@@ -1635,7 +1642,8 @@ async def root():
             "FIXED: PDFExporter: Corrected `SimpleDocDocument` to `SimpleDocTemplate`",
             "FIXED: `KeyError: \"Style 'Heading1' already defined in stylesheet\"` by removing redundant style additions in `PDFExporter`'s `__init__`.",
             "FIXED: `no such table: sessions` error by ensuring schema initialization is attempted when a new persistent database connection is established.",
-            "FIXED: `connect() got an unexpected keyword argument 'timeout'` by removing the `timeout` parameter from `sqlitecloud.connect` calls to align with `fifi.py`."
+            "FIXED: `connect() got an unexpected keyword argument 'timeout'` by removing the `timeout` parameter from `sqlitecloud.connect` calls to align with `fifi.py`.",
+            "ENHANCED: More verbose logging for SQLite Cloud connection failures in `_ensure_connection_with_timeout`."
         ],
         "cleanup_logic_complete": {
             "5_minute_timeout_check": "IMPLEMENTED - Sessions inactive for 5+ minutes are processed",
