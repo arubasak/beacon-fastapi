@@ -1101,8 +1101,9 @@ class ResilientDatabaseManager:
 class PDFExporter:
     def __init__(self):
         self.styles = getSampleStyleSheet()
-        # The following lines are removed as 'Heading1' and 'Normal' are already provided by getSampleStyleSheet()
-        # self.styles.add(ParagraphStyle(name='Heading1', fontSize=18, leading=22, spaceAfter=12)) # Ensure Heading1 exists
+        # Removed the redundant additions for 'Heading1' and 'Normal' as they are already
+        # provided by getSampleStyleSheet() and caused a KeyError.
+        # self.styles.add(ParagraphStyle(name='Heading1', fontSize=18, leading=22, spaceAfter=12))
         # self.styles.add(ParagraphStyle(name='Normal', fontSize=10, leading=14, spaceAfter=6))
         self.styles.add(ParagraphStyle(name='UserMessage', backColor=lightgrey, fontSize=10, leading=14, spaceAfter=6))
 
