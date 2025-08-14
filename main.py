@@ -356,7 +356,7 @@ class ResilientDatabaseManager:
                 
                 connection_start_attempt = datetime.now()
                 # Pass a timeout to the underlying connect method if possible (sqlitecloud supports `timeout` param)
-                self.conn = await asyncio.to_thread(sqlitecloud.connect, self.connection_string, timeout=min(5, max_wait_seconds))
+                self.conn = await asyncio.to_thread(sqlitecloud.connect, self.connection_string)
                 
                 # Test the connection to confirm it's truly open
                 test_result = await asyncio.to_thread(self.conn.execute, "SELECT 1 as connection_test")
