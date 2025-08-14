@@ -437,6 +437,13 @@ class ResilientDatabaseManager:
 
     def _init_complete_database_sync(self):
         """Initialize database schema with all columns upfront (synchronous version for to_thread)"""
+        # --- NEW IMPORT FOR SQLITECLOUD EXCEPTION TYPE ---
+        try:
+            from sqlitecloud.exceptions import SQLiteCloudOperationalError as SQLiteCloudOperationalError # Import specific exception
+        except ImportError:
+            SQLiteCloudOperationalError = type('DummySQLiteCloudOperationalError', (sqlite3.OperationalError,), {}) # Fallback to sqlite3 type if not available
+        # --- END NEW IMPORT ---
+
         try:
             if hasattr(self.conn, 'row_factory'): 
                 self.conn.row_factory = None
@@ -502,13 +509,15 @@ class ResilientDatabaseManager:
                 try:
                     self.conn.execute(f"ALTER TABLE sessions ADD COLUMN {col_name} {col_type}")
                     logger.info(f"✅ Added {col_name} column to existing database for compatibility.")
-                except sqlite3.OperationalError as e:
+                except (sqlite3.OperationalError, SQLiteCloudOperationalError) as e: # Catch both SQLite3 and SQLiteCloud specific errors
                     # Catch specific error when column already exists
                     if "duplicate column name" in str(e).lower() or "already exists" in str(e).lower():
                         logger.debug(f"Column {col_name} already exists, skipping ALTER TABLE.")
                     else:
-                        raise e # Re-raise for other operational errors
+                        raise e # Re-raise for other operational errors that are not about duplicate columns
                 except Exception as e:
+                    # This fallback should ideally not be hit for duplicate column errors anymore.
+                    # It will catch other unexpected errors during ALTER TABLE.
                     logger.error(f"❌ Error adding column {col_name}: {e}", exc_info=True)
                     raise # Critical failure for schema consistency
 
@@ -1556,7 +1565,7 @@ async def _perform_emergency_crm_save(session_id: str, reason: str):
         # If Zoho returned a contact_id and it's not already set in session, update it
         if save_result.get("contact_id") and not session.zoho_contact_id:
             session.zoho_contact_id = save_result["contact_id"]
-            logger.info(f"🔗 Saved contact ID {save_result['contact_id']} to session {session.session_id[:8]} during emergency save.")
+            logger.info(f"🔗 Background CRM - Saved contact ID {save_result['contact_id']} to session {session.session_id[:8]}.")
 
         await db_manager.save_session(session)
         logger.info(f"✅ Background CRM save task finished for session {session.session_id[:8]} (PDF: {save_result.get('pdf_attached', False)}, Active: {session.active})")
@@ -1643,7 +1652,8 @@ async def root():
             "FIXED: `KeyError: \"Style 'Heading1' already defined in stylesheet\"` by removing redundant style additions in `PDFExporter`'s `__init__`.",
             "FIXED: `no such table: sessions` error by ensuring schema initialization is attempted when a new persistent database connection is established.",
             "FIXED: `connect() got an unexpected keyword argument 'timeout'` by removing the `timeout` parameter from `sqlitecloud.connect` calls to align with `fifi.py`.",
-            "ENHANCED: More verbose logging for SQLite Cloud connection failures in `_ensure_connection_with_timeout`."
+            "ENHANCED: More verbose logging for SQLite Cloud connection failures in `_ensure_connection_with_timeout`.",
+            "CRITICAL FIX: Schema initialization now correctly handles `sqlitecloud.exceptions.SQLiteCloudOperationalError` for 'duplicate column name' errors, preventing fallback to memory."
         ],
         "cleanup_logic_complete": {
             "5_minute_timeout_check": "IMPLEMENTED - Sessions inactive for 5+ minutes are processed",
