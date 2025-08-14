@@ -17,7 +17,7 @@ from collections import defaultdict
 import io
 import html
 import re
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer # Corrected import for SimpleDocTemplate
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.colors import lightgrey
@@ -792,7 +792,7 @@ class ResilientDatabaseManager:
                         reverification_pending=loaded_reverification_pending,
                         pending_user_type=loaded_pending_user_type,
                         pending_email=loaded_pending_email,
-                        pending_full_name=loaded_full_name, # FIXED: Use loaded_full_name
+                        pending_full_name=loaded_pending_full_name,
                         pending_zoho_contact_id=loaded_pending_zoho_contact_id,
                         pending_wp_token=loaded_pending_wp_token
                     )
@@ -969,7 +969,7 @@ class ResilientDatabaseManager:
                             logger.warning(f"❌ Skipping session with insufficient columns ({len(row)}) from cleanup query: {row[0][:8]}")
                             continue
 
-                        # FIXED: Safely access all fields
+                        # Safely access all fields
                         loaded_display_message_offset = row[31] if len(row) > 31 else 0
                         loaded_reverification_pending = bool(row[32]) if len(row) > 32 else False
                         loaded_pending_user_type = UserType(row[33]) if len(row) > 33 and row[33] else None
@@ -1075,8 +1075,6 @@ class ResilientDatabaseManager:
                 
                 logger.info(f"✅ Background CRM processing completed: {len(sessions_to_crm_process)} sessions processed, {crm_saved_count} saved to CRM, {crm_failed_count} failed")
                 
-                # Removed the misplaced 'else:' here. The following lines will now execute as intended
-                # after the 'for' loop completes, within the outer 'try' block.
                 logger.info("✅ Background cleanup completed successfully with INDIVIDUAL CRM PROCESSING")
                 
                 return {
@@ -1103,8 +1101,9 @@ class ResilientDatabaseManager:
 class PDFExporter:
     def __init__(self):
         self.styles = getSampleStyleSheet()
-        self.styles.add(ParagraphStyle(name='Heading1', fontSize=18, leading=22, spaceAfter=12)) # Ensure Heading1 exists
-        self.styles.add(ParagraphStyle(name='Normal', fontSize=10, leading=14, spaceAfter=6))
+        # The following lines are removed as 'Heading1' and 'Normal' are already provided by getSampleStyleSheet()
+        # self.styles.add(ParagraphStyle(name='Heading1', fontSize=18, leading=22, spaceAfter=12)) # Ensure Heading1 exists
+        # self.styles.add(ParagraphStyle(name='Normal', fontSize=10, leading=14, spaceAfter=6))
         self.styles.add(ParagraphStyle(name='UserMessage', backColor=lightgrey, fontSize=10, leading=14, spaceAfter=6))
 
     async def generate_chat_pdf(self, session: UserSession) -> Optional[io.BytesIO]:
@@ -1600,7 +1599,8 @@ async def root():
             "CRITICAL FIX: `fetchone()` comparison bug (`test_result_fetched == 1` changed to `test_result_fetched[0] == 1`).",
             "FIXED: Zoho CRM `_find_contact_by_email` and `_create_contact` response parsing for `data['data']` which is a list.",
             "SYNTAX ERROR FIX: Fixed orphaned else block in cleanup_expired_sessions method",
-            "FIXED: PDFExporter: Corrected `SimpleDocDocument` to `SimpleDocTemplate`"
+            "FIXED: PDFExporter: Corrected `SimpleDocDocument` to `SimpleDocTemplate`",
+            "FIXED: `KeyError: \"Style 'Heading1' already defined in stylesheet\"` by removing redundant style additions in `PDFExporter`'s `__init__`."
         ],
         "cleanup_logic_complete": {
             "5_minute_timeout_check": "IMPLEMENTED - Sessions inactive for 5+ minutes are processed",
