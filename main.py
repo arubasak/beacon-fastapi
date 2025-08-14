@@ -1172,8 +1172,9 @@ class PDFExporter:
                 content = html.escape(str(msg.get('content', '')))
                 content = re.sub(r'<[^>]+>', '', content)
                 
-                if len(content) > 200: # Truncate for summary in PDF as well if too long
-                    content = content[:200] + "..."
+                # REMOVED TRUNCATION: This line was causing the PDF content to be truncated.
+                # if len(content) > 200: # Truncate for summary in PDF as well if too long
+                #     content = content[:200] + "..."
                     
                 style = self.styles['UserMessage'] if role == 'User' else self.styles['Normal']
                 story.append(Spacer(1, 8))
@@ -1300,6 +1301,7 @@ class ZohoCRMManager:
         try:
             headers = {'Authorization': f'Zoho-oauthtoken {access_token}', 'Content-Type': 'application/json'}
             
+            # This truncation remains due to Zoho API's 32,000 character limit for Note_Content
             if len(note_content) > 32000:
                 logger.warning(f"⚠️ Note content for {contact_id} exceeds 32000 chars. Truncating.")
                 note_content = note_content[:32000 - 100] + "\n\n[Content truncated due to size limits]" 
@@ -1421,8 +1423,9 @@ class ZohoCRMManager:
                 role = msg.get("role", "Unknown").capitalize()
                 content = re.sub(r'<[^>]+>', '', msg.get("content", ""))
                 
-                if len(content) > 200:
-                    content = content[:200] + "..."
+                # REMOVED TRUNCATION FOR NOTES CONTENT
+                # if len(content) > 200:
+                #     content = content[:200] + "..."
                     
                 note_content += f"\n{i+1}. **{role}:** {content}\n"
                 
@@ -1653,7 +1656,9 @@ async def root():
             "FIXED: `no such table: sessions` error by ensuring schema initialization is attempted when a new persistent database connection is established.",
             "FIXED: `connect() got an unexpected keyword argument 'timeout'` by removing the `timeout` parameter from `sqlitecloud.connect` calls to align with `fifi.py`.",
             "ENHANCED: More verbose logging for SQLite Cloud connection failures in `_ensure_connection_with_timeout`.",
-            "CRITICAL FIX: Schema initialization now correctly handles `sqlitecloud.exceptions.SQLiteCloudOperationalError` for 'duplicate column name' errors, preventing fallback to memory."
+            "CRITICAL FIX: Schema initialization now correctly handles `sqlitecloud.exceptions.SQLiteCloudOperationalError` for 'duplicate column name' errors, preventing fallback to memory.",
+            "CRITICAL FIX: Removed message content truncation in PDF generation for full chat transcripts.",
+            "CRITICAL FIX: Removed individual message content truncation within Zoho Notes content generation for full detail (Zoho API's 32k character limit for entire note remains)." # NEW FIX
         ],
         "cleanup_logic_complete": {
             "5_minute_timeout_check": "IMPLEMENTED - Sessions inactive for 5+ minutes are processed",
