@@ -128,7 +128,7 @@ class UserSession:
     last_activity: datetime = field(default_factory=datetime.now)
     timeout_saved_to_crm: bool = False
     fingerprint_id: Optional[str] = None
-    fingerprint_method: Optional[str] = None # Correctly defined here
+    fingerprint_method: Optional[str] = None # Correctly defined here in the dataclass
     visitor_type: str = "new_visitor"
     recognition_response: Optional[str] = None
     daily_question_count: int = 0
@@ -438,7 +438,8 @@ class ResilientDatabaseManager:
                 "last_activity": datetime.fromisoformat(row[6]) if row[6] else datetime.now(),
                 "messages": safe_json_loads(row[7]), "active": bool(row[8]), "wp_token": row[9],
                 "timeout_saved_to_crm": bool(row[10]), "fingerprint_id": row[11],
-                "fingerprint_method": row[12], "visitor_type": row[13] or 'new_visitor',
+                "fingerprint_method": row[12], # Correctly fetching from row[12]
+                "visitor_type": row[13] or 'new_visitor',
                 "daily_question_count": row[14] or 0, "total_question_count": row[15] or 0,
                 "last_question_time": datetime.fromisoformat(row[16]) if row[16] else None,
                 "question_limit_reached": bool(row[17]), "ban_status": BanStatus(row[18]) if row[18] else BanStatus.NONE,
@@ -481,7 +482,7 @@ class ResilientDatabaseManager:
             ''', (session.session_id, session.user_type.value, session.email, session.full_name,
                      session.zoho_contact_id, session.created_at.isoformat(), session.last_activity.isoformat(),
                      json_messages, int(session.active), session.wp_token, int(session.timeout_saved_to_crm),
-                     session.fingerprint_id, session.fingerprint_method, session.visitor_type, # Corrected typo here
+                     session.fingerprint_id, session.fingerprint_method, session.visitor_type, # <--- THIS IS THE CORRECTED LINE 484
                      session.daily_question_count, session.total_question_count, 
                      session.last_question_time.isoformat() if session.last_question_time else None,
                      int(session.question_limit_reached), session.ban_status.value,
