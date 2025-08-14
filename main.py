@@ -119,6 +119,7 @@ async def startup_event():
 # Models (UPDATED FOR COMPATIBILITY)
 class EmergencySaveRequest(BaseModel):
     session_id: str
+
     reason: str
     timestamp: Optional[int] = None
 
@@ -212,9 +213,8 @@ class ResilientDatabaseManager:
         self._auth_method = None
         self.db_type = "memory" # Start in memory mode by default
         self.local_sessions = {} # For in-memory fallback
-        self._initialized_schema = False
-        self._initialization_attempted_in_session = False # Tracks init per method call context
-        
+        self._initialized_schema = False # Flag indicates if persistent schema has been created in the current DB
+
         logger.info("🔄 ResilientDatabaseManager initialized (LAZY ASYNC - NO BLOCKING I/O in constructor)")
         if connection_string:
             self._analyze_connection_string()
@@ -248,59 +248,88 @@ class ResilientDatabaseManager:
         """CRITICAL: Time-limited connection establishment to prevent 504 timeouts for the calling async task."""
         start_time = datetime.now()
         
-        # Check existing connection first before attempting re-connection logic
-        if self.conn and await asyncio.to_thread(self._check_connection_health_sync) and self._initialized_schema:
-            logger.debug("✅ Connection healthy and schema initialized, reusing existing connection.")
+        # 1. If connection is already healthy AND non-memory, reuse.
+        if self.conn and self.db_type != "memory" and await asyncio.to_thread(self._check_connection_health_sync):
+            logger.debug("✅ Persistent connection healthy, reusing.")
+            # Ensure schema is considered initialized if we successfully reuse a persistent connection
+            if not self._initialized_schema:
+                try:
+                    await asyncio.to_thread(self._init_complete_database_sync) # Ensure schema exists if not yet
+                    self._initialized_schema = True
+                    logger.info("✅ Ensured schema initialized on reuse.")
+                except Exception as e:
+                    logger.error(f"❌ Schema check on reuse failed: {e}. Forcing re-connection.", exc_info=True)
+                    self.conn = None # Invalidate so it tries to re-connect
+                    self.db_type = "memory" # Reset to memory mode
+                    self._initialized_schema = False # Reset schema flag
+            if self.conn: # If schema check/init didn't fail
+                return True
+
+        # 2. If already in memory mode and no time left for a proper connection attempt, just return True.
+        if self.db_type == "memory" and (datetime.now() - start_time).total_seconds() >= max_wait_seconds:
+            logger.warning("⏰ Already in memory mode and ran out of time for new connection attempt. Sticking to memory.")
             return True
-        
-        # If a connection attempt was recently made and failed, stick to memory for a bit
+
+        # 3. If a connection attempt was recently made and failed, stick to memory for a bit
         # This prevents endless rapid retries on a truly broken connection.
-        if self._initialization_attempted_in_session and (datetime.now() - self._last_health_check if self._last_health_check else timedelta(0)).total_seconds() < 5:
+        if self._initialization_attempted_in_session and \
+           (datetime.now() - self._last_health_check if self._last_health_check else timedelta(0)).total_seconds() < 5:
              logger.warning("⚠️ Recent initialization attempt detected, sticking to current (likely memory) mode for speed")
-             return True # Remain in current state (memory or broken)
-        
+             return True
+
+        # If we reach here, we need to establish a new connection.
         self._initialization_attempted_in_session = True # Mark that an attempt is being made
         self._last_health_check = datetime.now() # Reset health check timer for this attempt
 
-        if self.conn: # Close existing unhealthy/stale connection
-            logger.warning("⚠️ Existing connection unhealthy or schema not initialized. Re-establishing.")
+        # Close any existing unhealthy/stale connection
+        if self.conn:
+            logger.warning("⚠️ Existing connection unhealthy or being re-established. Closing.")
             try:
                 await asyncio.to_thread(self.conn.close)
             except Exception as e:
                 logger.debug(f"⚠️ Error closing old DB connection: {e}")
             self.conn = None
-            self.db_type = "memory" # Reset to ensure re-evaluation logic below
+            self.db_type = "memory" # Temporarily assume memory until new connection established
+        
+        # IMPORTANT: Reset schema flag before attempting a new persistent connection.
+        # This is crucial for the "no such table" fix.
+        self._initialized_schema = False 
 
         # Attempt Cloud connection
-        if (self.connection_string and SQLITECLOUD_AVAILABLE and 
-            (datetime.now() - start_time).total_seconds() < max_wait_seconds):
-            logger.info("🔄 Attempting QUICK SQLite Cloud connection...")
-            await self._attempt_quick_cloud_connection_async(max_wait_seconds - (datetime.now() - start_time).total_seconds())
-        
-        # Fallback to local SQLite if cloud failed or not configured
-        if not self.conn and (datetime.now() - start_time).total_seconds() < max_wait_seconds:
-            logger.info("☁️ Cloud connection failed/unavailable, trying local SQLite...")
-            await asyncio.to_thread(self._attempt_local_connection_sync)
-
-        # Initialize schema if connection is successful but schema isn't
-        if self.conn and not self._initialized_schema and (datetime.now() - start_time).total_seconds() < max_wait_seconds:
+        cloud_connection_successful = False
+        if self.connection_string and SQLITECLOUD_AVAILABLE:
             try:
+                await self._attempt_quick_cloud_connection_async(max_wait_seconds - (datetime.now() - start_time).total_seconds())
+                if self.conn and self.db_type == "cloud":
+                    cloud_connection_successful = True
+            except Exception as e:
+                logger.debug(f"Cloud connection attempt failed in _ensure_connection: {e}")
+                self.conn = None # Ensure connection is reset on failure here too
+                self.db_type = "memory" # Ensure db_type is memory if cloud fails
+
+        # Fallback to local SQLite if cloud failed or not configured, and still no persistent connection
+        if not cloud_connection_successful: # Only try local if cloud wasn't successful
+            logger.info("☁️ Cloud connection failed/unavailable, trying local SQLite...")
+            await asyncio.to_thread(self._attempt_local_connection_sync) # This sets self.conn and self.db_type
+
+        # If a non-memory connection is now established (either cloud or local), ensure schema is initialized
+        if self.conn and self.db_type != "memory":
+            try:
+                # Always attempt schema initialization on a new non-memory connection or when coming from memory mode.
+                # CREATE TABLE IF NOT EXISTS makes this idempotent and safe to run multiple times.
                 await asyncio.to_thread(self._init_complete_database_sync)
-                self._initialized_schema = True
+                self._initialized_schema = True # Set True only if persistent schema init succeeded
                 logger.info("✅ Database schema initialized successfully.")
             except Exception as e:
-                logger.error(f"❌ Schema initialization failed: {e}. Falling back to memory.")
-                await asyncio.to_thread(self._fallback_to_memory_sync)
-                return True
+                logger.error(f"❌ Schema initialization failed: {e}. Falling back to memory.", exc_info=True)
+                await asyncio.to_thread(self._fallback_to_memory_sync) # This will set db_type="memory" and _initialized_schema=True.
+                return True # Schema init failed, forced to memory, so return True (processed)
 
-        # Final check: if still no connection after all attempts or time ran out, fall back to memory
-        if not self.conn or (datetime.now() - start_time).total_seconds() > max_wait_seconds:
-            if (datetime.now() - start_time).total_seconds() > max_wait_seconds:
-                logger.warning(f"⏰ Initialization timeout after {(datetime.now() - start_time).total_seconds():.1f}s, forcing memory fallback.")
-            else:
-                 logger.warning("🚨 Connection failed after all attempts, falling back to in-memory storage.")
-            await asyncio.to_thread(self._fallback_to_memory_sync)
-            
+        # Final check: if still no successful persistent connection, ensure we're in memory mode.
+        if not self.conn or self.db_type == "memory":
+            logger.warning("🚨 No persistent connection could be established. Falling back to in-memory storage.")
+            await asyncio.to_thread(self._fallback_to_memory_sync) # This sets db_type="memory" and _initialized_schema=True.
+
         return True # Connection established (or fallback to memory)
 
     async def _attempt_quick_cloud_connection_async(self, max_wait_seconds: float):
@@ -359,8 +388,7 @@ class ResilientDatabaseManager:
                 max_wait_seconds -= elapsed_this_attempt
                 
                 if attempt < max_attempts - 1 and max_wait_seconds > 0.5: # Ensure some time left for sleep and next attempt
-                    wait_time = min(2, max_wait_seconds / (max_attempts - attempt)) # Distribute remaining time
-                    await asyncio.sleep(wait_time)
+                    await asyncio.sleep(min(2, max_wait_seconds / (max_attempts - attempt))) # Distribute remaining time
 
         logger.error(f"❌ All {max_attempts} QUICK SQLite Cloud connection attempts failed")
         self.db_type = "memory" # Fallback to memory if all quick cloud attempts fail
@@ -393,7 +421,8 @@ class ResilientDatabaseManager:
         self.conn = None
         self.db_type = "memory"
         self.local_sessions = {} # Clear any partial local state
-        self._initialized_schema = True # Assume schema exists in memory logic
+        # In memory, schema is recreated on each run, so consider it "initialized" for memory logic
+        self._initialized_schema = True 
         logger.warning("⚠️ Operating in in-memory mode due to connection issues")
 
     def _init_complete_database_sync(self):
@@ -1601,7 +1630,8 @@ async def root():
             "FIXED: Zoho CRM `_find_contact_by_email` and `_create_contact` response parsing for `data['data']` which is a list.",
             "SYNTAX ERROR FIX: Fixed orphaned else block in cleanup_expired_sessions method",
             "FIXED: PDFExporter: Corrected `SimpleDocDocument` to `SimpleDocTemplate`",
-            "FIXED: `KeyError: \"Style 'Heading1' already defined in stylesheet\"` by removing redundant style additions in `PDFExporter`'s `__init__`."
+            "FIXED: `KeyError: \"Style 'Heading1' already defined in stylesheet\"` by removing redundant style additions in `PDFExporter`'s `__init__`.",
+            "FIXED: `no such table: sessions` error by ensuring schema initialization is attempted when a new persistent database connection is established."
         ],
         "cleanup_logic_complete": {
             "5_minute_timeout_check": "IMPLEMENTED - Sessions inactive for 5+ minutes are processed",
