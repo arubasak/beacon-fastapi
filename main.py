@@ -214,6 +214,7 @@ class ResilientDatabaseManager:
         self.db_type = "memory" # Start in memory mode by default
         self.local_sessions = {} # For in-memory fallback
         self._initialized_schema = False # Flag indicates if persistent schema has been created in the current DB
+        self._initialization_attempted_in_session = False # Initialize the new attribute
 
         logger.info("🔄 ResilientDatabaseManager initialized (LAZY ASYNC - NO BLOCKING I/O in constructor)")
         if connection_string:
