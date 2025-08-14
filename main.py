@@ -17,7 +17,7 @@ from collections import defaultdict
 import io
 import html
 import re
-from reportlab.platypus import SimpleDocDocument, Paragraph, Spacer
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer # Corrected import for SimpleDocTemplate
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.colors import lightgrey
@@ -415,6 +415,8 @@ class ResilientDatabaseManager:
                     last_activity TEXT DEFAULT '',
                     messages TEXT DEFAULT '[]',
                     active INTEGER DEFAULT 1,
+                    wp_token TEXT,
+                    timeout_saved_to_crm INTEGER DEFAULT 0,
                     fingerprint_id TEXT,
                     fingerprint_method TEXT,
                     visitor_type TEXT DEFAULT 'new_visitor',
@@ -434,8 +436,6 @@ class ResilientDatabaseManager:
                     browser_privacy_level TEXT,
                     registration_prompted INTEGER DEFAULT 0,
                     registration_link_clicked INTEGER DEFAULT 0,
-                    wp_token TEXT,
-                    timeout_saved_to_crm INTEGER DEFAULT 0,
                     recognition_response TEXT,
                     display_message_offset INTEGER DEFAULT 0,
                     -- NEW: Re-verification fields from fifi.py for compatibility
@@ -792,7 +792,7 @@ class ResilientDatabaseManager:
                         reverification_pending=loaded_reverification_pending,
                         pending_user_type=loaded_pending_user_type,
                         pending_email=loaded_pending_email,
-                        pending_full_name=loaded_pending_full_name,
+                        pending_full_name=loaded_full_name, # FIXED: Use loaded_full_name
                         pending_zoho_contact_id=loaded_pending_zoho_contact_id,
                         pending_wp_token=loaded_pending_wp_token
                     )
@@ -1075,6 +1075,8 @@ class ResilientDatabaseManager:
                 
                 logger.info(f"✅ Background CRM processing completed: {len(sessions_to_crm_process)} sessions processed, {crm_saved_count} saved to CRM, {crm_failed_count} failed")
                 
+                # Removed the misplaced 'else:' here. The following lines will now execute as intended
+                # after the 'for' loop completes, within the outer 'try' block.
                 logger.info("✅ Background cleanup completed successfully with INDIVIDUAL CRM PROCESSING")
                 
                 return {
@@ -1597,7 +1599,8 @@ async def root():
             "CRITICAL FIX: `UserSession` dataclass and corresponding DB `SELECT`/`INSERT`/`REPLACE` queries fully aligned with `fifi.py`'s latest schema (including `reverification_pending` fields).",
             "CRITICAL FIX: `fetchone()` comparison bug (`test_result_fetched == 1` changed to `test_result_fetched[0] == 1`).",
             "FIXED: Zoho CRM `_find_contact_by_email` and `_create_contact` response parsing for `data['data']` which is a list.",
-            "SYNTAX ERROR FIX: Fixed orphaned except block in cleanup_expired_sessions method"
+            "SYNTAX ERROR FIX: Fixed orphaned else block in cleanup_expired_sessions method",
+            "FIXED: PDFExporter: Corrected `SimpleDocDocument` to `SimpleDocTemplate`"
         ],
         "cleanup_logic_complete": {
             "5_minute_timeout_check": "IMPLEMENTED - Sessions inactive for 5+ minutes are processed",
