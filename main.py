@@ -128,7 +128,7 @@ class UserSession:
     last_activity: datetime = field(default_factory=datetime.now)
     timeout_saved_to_crm: bool = False
     fingerprint_id: Optional[str] = None
-    fingerprint_method: Optional[str] = None
+    fingerprint_method: Optional[str] = None # Correctly defined here
     visitor_type: str = "new_visitor"
     recognition_response: Optional[str] = None
     daily_question_count: int = 0
@@ -479,20 +479,20 @@ class ResilientDatabaseManager:
                 pending_zoho_contact_id, pending_wp_token) 
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (session.session_id, session.user_type.value, session.email, session.full_name,
-                 session.zoho_contact_id, session.created_at.isoformat(), session.last_activity.isoformat(),
-                 json_messages, int(session.active), session.wp_token, int(session.timeout_saved_to_crm),
-                 session.fingerprint_id, session.finger_print_method, session.visitor_type,
-                 session.daily_question_count, session.total_question_count, 
-                 session.last_question_time.isoformat() if session.last_question_time else None,
-                 int(session.question_limit_reached), session.ban_status.value,
-                 session.ban_start_time.isoformat() if session.ban_start_time else None,
-                 session.ban_end_time.isoformat() if session.ban_end_time else None,
-                 session.ban_reason, session.evasion_count, session.current_penalty_hours,
-                 session.escalation_level, json_emails_used, session.email_switches_count,
-                 session.browser_privacy_level, int(session.registration_prompted),
-                 int(session.registration_link_clicked), session.recognition_response, session.display_message_offset,
-                 int(session.reverification_pending), pending_user_type_value, session.pending_email,
-                 session.pending_full_name, session.pending_zoho_contact_id, session.pending_wp_token))
+                     session.zoho_contact_id, session.created_at.isoformat(), session.last_activity.isoformat(),
+                     json_messages, int(session.active), session.wp_token, int(session.timeout_saved_to_crm),
+                     session.fingerprint_id, session.fingerprint_method, session.visitor_type, # Corrected typo here
+                     session.daily_question_count, session.total_question_count, 
+                     session.last_question_time.isoformat() if session.last_question_time else None,
+                     int(session.question_limit_reached), session.ban_status.value,
+                     session.ban_start_time.isoformat() if session.ban_start_time else None,
+                     session.ban_end_time.isoformat() if session.ban_end_time else None,
+                     session.ban_reason, session.evasion_count, session.current_penalty_hours,
+                     session.escalation_level, json_emails_used, session.email_switches_count,
+                     session.browser_privacy_level, int(session.registration_prompted),
+                     int(session.registration_link_clicked), session.recognition_response, session.display_message_offset,
+                     int(session.reverification_pending), pending_user_type_value, session.pending_email,
+                     session.pending_full_name, session.pending_zoho_contact_id, session.pending_wp_token))
             await asyncio.to_thread(self.conn.commit)
         except Exception as e:
             logger.error(f"❌ Failed to save session {session.session_id[:8]}: {e}", exc_info=True)
