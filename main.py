@@ -40,14 +40,15 @@ app.add_middleware(
     max_age=3600,
 )
 
-# OPTIONS handlers for preflight requests
-@app.options("/emergency-save")
-async def emergency_save_options():
-    return {"status": "ok"}
-
-@app.options("/cleanup-expired-sessions")
-async def cleanup_options():
-    return {"status": "ok"}
+# REMOVED: The manual OPTIONS handlers are no longer needed.
+# The CORSMiddleware above will handle preflight requests automatically.
+# @app.options("/emergency-save")
+# async def emergency_save_options():
+#     return {"status": "ok"}
+# 
+# @app.options("/cleanup-expired-sessions")
+# async def cleanup_options():
+#     return {"status": "ok"}
 
 # Configuration from environment variables
 SQLITE_CLOUD_CONNECTION = os.getenv("SQLITE_CLOUD_CONNECTION")
