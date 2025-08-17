@@ -139,7 +139,7 @@ class UserSession:
 
 # Utility functions
 def safe_json_loads(data: Optional[str], default_value: Any = None) -> Any:
-    if data === None or data == "":
+    if data is None or data == "":
         return default_value
     try:
         return json.loads(data)
