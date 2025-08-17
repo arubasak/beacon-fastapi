@@ -5,7 +5,7 @@ import logging
 import os
 import json
 import sqlite3
-import threading  # FIX #1: Re-added the missing import
+import threading
 import copy
 import httpx
 import asyncio
@@ -154,7 +154,6 @@ def safe_json_loads(data: Optional[str], default_value: Any = None) -> Any:
         logger.warning(f"Failed to decode JSON data: {str(data)[:100]}...")
         return default_value
 
-# FIX #2: Add safe datetime parsing function
 def safe_parse_datetime(value):
     """
     Safely parse datetime values from various data types
@@ -431,33 +430,69 @@ class ResilientDatabaseManager:
             if self.db_type == "memory":
                 session = self.local_sessions.get(session_id); return copy.deepcopy(session) if session else None
             try:
-                cursor = await self._execute_with_socket_retry_async("SELECT * FROM sessions WHERE session_id = ? AND active = 1", (session_id,))
+                # FIX: Use explicit column names instead of SELECT * to avoid column misalignment
+                cursor = await self._execute_with_socket_retry_async("""
+                    SELECT session_id, user_type, email, full_name, zoho_contact_id, 
+                           created_at, last_activity, messages, active, wp_token, 
+                           timeout_saved_to_crm, fingerprint_id, fingerprint_method, 
+                           visitor_type, daily_question_count, total_question_count, 
+                           last_question_time, question_limit_reached, ban_status, 
+                           ban_start_time, ban_end_time, ban_reason, evasion_count, 
+                           current_penalty_hours, escalation_level, email_addresses_used, 
+                           email_switches_count, browser_privacy_level, registration_prompted, 
+                           registration_link_clicked, recognition_response, display_message_offset, 
+                           reverification_pending, pending_user_type, pending_email, 
+                           pending_full_name, pending_zoho_contact_id, pending_wp_token
+                    FROM sessions 
+                    WHERE session_id = ? AND active = 1
+                """, (session_id,))
                 row = await asyncio.to_thread(cursor.fetchone)
                 if not row: return None
                 
                 row_dict = {
-                    "session_id": row[0], "user_type": UserType(row[1]), "email": row[2], "full_name": row[3],
-                    "zoho_contact_id": row[4], "created_at": datetime.fromisoformat(row[5]), 
-                    "last_activity": datetime.fromisoformat(row[6]) if row[6] else None, "messages": safe_json_loads(row[7], []),
-                    "active": bool(row[8]), "wp_token": row[9], "timeout_saved_to_crm": bool(row[10]),
-                    "fingerprint_id": row[11], "fingerprint_method": row[12], "visitor_type": row[13],
-                    "daily_question_count": row[14], "total_question_count": row[15],
-                    "last_question_time": safe_parse_datetime(row[16]),  # FIXED LINE
-                    "question_limit_reached": bool(row[17]), "ban_status": BanStatus(row[18]),
-                    "ban_start_time": safe_parse_datetime(row[19]),  # FIXED LINE
-                    "ban_end_time": safe_parse_datetime(row[20]),  # FIXED LINE
-                    "ban_reason": row[21], "evasion_count": row[22], "current_penalty_hours": row[23],
-                    "escalation_level": row[24], "email_addresses_used": safe_json_loads(row[25], []),
-                    "email_switches_count": row[26], "browser_privacy_level": row[27],
-                    "registration_prompted": bool(row[28]), "registration_link_clicked": bool(row[29]),
-                    "recognition_response": row[30], "display_message_offset": row[31],
+                    "session_id": row[0], 
+                    "user_type": UserType(row[1]), 
+                    "email": row[2], 
+                    "full_name": row[3],
+                    "zoho_contact_id": row[4], 
+                    "created_at": safe_parse_datetime(row[5]) or datetime.now(), 
+                    "last_activity": safe_parse_datetime(row[6]) or datetime.now(), 
+                    "messages": safe_json_loads(row[7], []),
+                    "active": bool(row[8]), 
+                    "wp_token": row[9], 
+                    "timeout_saved_to_crm": bool(row[10]),
+                    "fingerprint_id": row[11], 
+                    "fingerprint_method": row[12], 
+                    "visitor_type": row[13],
+                    "daily_question_count": row[14], 
+                    "total_question_count": row[15],
+                    "last_question_time": safe_parse_datetime(row[16]),  # FIXED
+                    "question_limit_reached": bool(row[17]), 
+                    "ban_status": BanStatus(row[18]) if row[18] else BanStatus.NONE,  # FIXED
+                    "ban_start_time": safe_parse_datetime(row[19]),  # FIXED
+                    "ban_end_time": safe_parse_datetime(row[20]),  # FIXED
+                    "ban_reason": row[21], 
+                    "evasion_count": row[22], 
+                    "current_penalty_hours": row[23],
+                    "escalation_level": row[24], 
+                    "email_addresses_used": safe_json_loads(row[25], []),
+                    "email_switches_count": row[26], 
+                    "browser_privacy_level": row[27],
+                    "registration_prompted": bool(row[28]), 
+                    "registration_link_clicked": bool(row[29]),
+                    "recognition_response": row[30], 
+                    "display_message_offset": row[31],
                     "reverification_pending": bool(row[32]), 
                     "pending_user_type": UserType(row[33]) if row[33] else None,
-                    "pending_email": row[34], "pending_full_name": row[35],
-                    "pending_zoho_contact_id": row[36], "pending_wp_token": row[37],
+                    "pending_email": row[34], 
+                    "pending_full_name": row[35],
+                    "pending_zoho_contact_id": row[36], 
+                    "pending_wp_token": row[37],
                 }
                 return UserSession(**row_dict)
-            except Exception as e: logger.error(f"❌ Failed to load session {session_id[:8]}: {e}", exc_info=True); return None
+            except Exception as e: 
+                logger.error(f"❌ Failed to load session {session_id[:8]}: {e}", exc_info=True)
+                return None
 
     async def save_session(self, session: UserSession):
         with self.lock:
@@ -507,8 +542,23 @@ class ResilientDatabaseManager:
             
             try:
                 cutoff_iso = (datetime.now() - timedelta(minutes=expiry_minutes)).isoformat()
+                
+                # FIX: Use explicit column names instead of SELECT * to avoid column misalignment
                 cursor = await self._execute_with_socket_retry_async(f"""
-                    SELECT * FROM sessions WHERE active = 1 AND last_activity < ? LIMIT {limit + 1}
+                    SELECT session_id, user_type, email, full_name, zoho_contact_id, 
+                           created_at, last_activity, messages, active, wp_token, 
+                           timeout_saved_to_crm, fingerprint_id, fingerprint_method, 
+                           visitor_type, daily_question_count, total_question_count, 
+                           last_question_time, question_limit_reached, ban_status, 
+                           ban_start_time, ban_end_time, ban_reason, evasion_count, 
+                           current_penalty_hours, escalation_level, email_addresses_used, 
+                           email_switches_count, browser_privacy_level, registration_prompted, 
+                           registration_link_clicked, recognition_response, display_message_offset, 
+                           reverification_pending, pending_user_type, pending_email, 
+                           pending_full_name, pending_zoho_contact_id, pending_wp_token
+                    FROM sessions 
+                    WHERE active = 1 AND last_activity < ? 
+                    LIMIT {limit + 1}
                 """, (cutoff_iso,))
                 
                 rows = await asyncio.to_thread(cursor.fetchall)
@@ -520,28 +570,46 @@ class ResilientDatabaseManager:
                 for row in sessions_to_process:
                     await asyncio.sleep(0)
                     try:
-                        # FIX #3: Updated session_data creation with safe datetime parsing
+                        # FIX: Now using correct positional indexing with explicit column order
                         session_data = {
-                            "session_id": row[0], "user_type": UserType(row[1]), "email": row[2], "full_name": row[3],
+                            "session_id": row[0], 
+                            "user_type": UserType(row[1]), 
+                            "email": row[2], 
+                            "full_name": row[3],
                             "zoho_contact_id": row[4], 
                             "created_at": safe_parse_datetime(row[5]) or datetime.now(), 
                             "last_activity": safe_parse_datetime(row[6]) or datetime.now(), 
-                            "messages": safe_json_loads(row[7], []), "active": bool(row[8]), "wp_token": row[9], 
-                            "timeout_saved_to_crm": bool(row[10]), "fingerprint_id": row[11], "fingerprint_method": row[12], 
-                            "visitor_type": row[13], "daily_question_count": row[14], "total_question_count": row[15],
-                            "last_question_time": safe_parse_datetime(row[16]),  # MAIN FIX: Use safe_parse_datetime
-                            "question_limit_reached": bool(row[17]), "ban_status": BanStatus(row[18]),
-                            "ban_start_time": safe_parse_datetime(row[19]),  # FIXED
-                            "ban_end_time": safe_parse_datetime(row[20]),  # FIXED
-                            "ban_reason": row[21], "evasion_count": row[22], "current_penalty_hours": row[23],
-                            "escalation_level": row[24], "email_addresses_used": safe_json_loads(row[25], []),
-                            "email_switches_count": row[26], "browser_privacy_level": row[27],
-                            "registration_prompted": bool(row[28]), "registration_link_clicked": bool(row[29]),
-                            "recognition_response": row[30], "display_message_offset": row[31],
+                            "messages": safe_json_loads(row[7], []), 
+                            "active": bool(row[8]), 
+                            "wp_token": row[9], 
+                            "timeout_saved_to_crm": bool(row[10]), 
+                            "fingerprint_id": row[11], 
+                            "fingerprint_method": row[12], 
+                            "visitor_type": row[13], 
+                            "daily_question_count": row[14], 
+                            "total_question_count": row[15],
+                            "last_question_time": safe_parse_datetime(row[16]),  # FIXED: Now correctly positioned
+                            "question_limit_reached": bool(row[17]), 
+                            "ban_status": BanStatus(row[18]) if row[18] else BanStatus.NONE,  # FIXED: Now correctly positioned
+                            "ban_start_time": safe_parse_datetime(row[19]),  
+                            "ban_end_time": safe_parse_datetime(row[20]),  
+                            "ban_reason": row[21], 
+                            "evasion_count": row[22], 
+                            "current_penalty_hours": row[23],
+                            "escalation_level": row[24], 
+                            "email_addresses_used": safe_json_loads(row[25], []),
+                            "email_switches_count": row[26], 
+                            "browser_privacy_level": row[27],
+                            "registration_prompted": bool(row[28]), 
+                            "registration_link_clicked": bool(row[29]),
+                            "recognition_response": row[30], 
+                            "display_message_offset": row[31],
                             "reverification_pending": bool(row[32]), 
                             "pending_user_type": UserType(row[33]) if row[33] else None,
-                            "pending_email": row[34], "pending_full_name": row[35],
-                            "pending_zoho_contact_id": row[36], "pending_wp_token": row[37],
+                            "pending_email": row[34], 
+                            "pending_full_name": row[35],
+                            "pending_zoho_contact_id": row[36], 
+                            "pending_wp_token": row[37],
                         }
                         session_obj = UserSession(**session_data)
 
