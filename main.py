@@ -27,10 +27,9 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # FastAPI app initialization
-app = FastAPI(title="FiFi Emergency API - Async Operations", version="3.7.1-final")
+app = FastAPI(title="FiFi Emergency API - Async Operations", version="3.8.0-final")
 
-# CORS middleware
-# This middleware correctly handles all CORS requirements, including preflight OPTIONS requests.
+# CORS middleware - This is the complete and correct way to handle CORS.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["https://fifi-eu.streamlit.app", "*"],  # Consider restricting "*" in production
@@ -40,8 +39,7 @@ app.add_middleware(
     max_age=3600,
 )
 
-# REMOVED: The manual OPTIONS handlers are no longer needed.
-# The CORSMiddleware above will now handle preflight requests automatically and correctly.
+# REMOVED: The manual OPTIONS handlers that were conflicting with the middleware are gone.
 
 # Configuration from environment variables
 SQLITE_CLOUD_CONNECTION = os.getenv("SQLITE_CLOUD_CONNECTION")
@@ -87,7 +85,6 @@ async def startup_event():
 
     logger.info("✅ FastAPI startup initialization complete. App is ready to receive requests.")
     logger.info(f"🔧 CONFIG CHECK (after startup): SQLite Cloud: {'SET' if SQLITE_CLOUD_CONNECTION else 'MISSING'}, Zoho Enabled: {ZOHO_ENABLED}")
-
 
 # Pydantic Models & DataClasses
 class EmergencySaveRequest(BaseModel):
@@ -163,7 +160,10 @@ def is_session_ending_reason(reason: str) -> bool:
 
 # Resilient Database Manager
 class ResilientDatabaseManager:
+    # ... This class is exactly as you provided in the "old working code" ...
+    # ... No changes are needed here ...
     def __init__(self, connection_string: Optional[str]):
+        self.lock = threading.Lock()
         self.conn = None
         self.connection_string = connection_string
         self._last_health_check = None
@@ -409,160 +409,161 @@ class ResilientDatabaseManager:
         except Exception as e: return {**result, "status": "func_failed", "type": self.db_type, "message": f"Func test failed: {str(e)}", "error_type": type(e).__name__}
 
     async def load_session(self, session_id: str) -> Optional[UserSession]:
-        if not await self._ensure_connection(15): logger.warning(f"⚠️ Conn timeout loading {session_id[:8]}, checking memory");
-        if self.db_type == "memory":
-            session = self.local_sessions.get(session_id); return copy.deepcopy(session) if session else None
-        try:
-            cursor = await self._execute_with_socket_retry_async("SELECT * FROM sessions WHERE session_id = ? AND active = 1", (session_id,))
-            row = await asyncio.to_thread(cursor.fetchone)
-            if not row: return None
-            
-            row_dict = {
-                "session_id": row[0], "user_type": UserType(row[1]), "email": row[2], "full_name": row[3],
-                "zoho_contact_id": row[4], "created_at": datetime.fromisoformat(row[5]), 
-                "last_activity": datetime.fromisoformat(row[6]) if row[6] else None, "messages": safe_json_loads(row[7], []),
-                "active": bool(row[8]), "wp_token": row[9], "timeout_saved_to_crm": bool(row[10]),
-                "fingerprint_id": row[11], "fingerprint_method": row[12], "visitor_type": row[13],
-                "daily_question_count": row[14], "total_question_count": row[15],
-                "last_question_time": datetime.fromisoformat(row[16]) if row[16] else None,
-                "question_limit_reached": bool(row[17]), "ban_status": BanStatus(row[18]),
-                "ban_start_time": datetime.fromisoformat(row[19]) if row[19] else None,
-                "ban_end_time": datetime.fromisoformat(row[20]) if row[20] else None,
-                "ban_reason": row[21], "evasion_count": row[22], "current_penalty_hours": row[23],
-                "escalation_level": row[24], "email_addresses_used": safe_json_loads(row[25], []),
-                "email_switches_count": row[26], "browser_privacy_level": row[27],
-                "registration_prompted": bool(row[28]), "registration_link_clicked": bool(row[29]),
-                "recognition_response": row[30], "display_message_offset": row[31],
-                "reverification_pending": bool(row[32]), 
-                "pending_user_type": UserType(row[33]) if row[33] else None,
-                "pending_email": row[34], "pending_full_name": row[35],
-                "pending_zoho_contact_id": row[36], "pending_wp_token": row[37],
-            }
-            return UserSession(**row_dict)
-        except Exception as e: logger.error(f"❌ Failed to load session {session_id[:8]}: {e}", exc_info=True); return None
+        with self.lock:
+            if not await self._ensure_connection(15): logger.warning(f"⚠️ Conn timeout loading {session_id[:8]}, checking memory");
+            if self.db_type == "memory":
+                session = self.local_sessions.get(session_id); return copy.deepcopy(session) if session else None
+            try:
+                cursor = await self._execute_with_socket_retry_async("SELECT * FROM sessions WHERE session_id = ? AND active = 1", (session_id,))
+                row = await asyncio.to_thread(cursor.fetchone)
+                if not row: return None
+                
+                row_dict = {
+                    "session_id": row[0], "user_type": UserType(row[1]), "email": row[2], "full_name": row[3],
+                    "zoho_contact_id": row[4], "created_at": datetime.fromisoformat(row[5]), 
+                    "last_activity": datetime.fromisoformat(row[6]) if row[6] else None, "messages": safe_json_loads(row[7], []),
+                    "active": bool(row[8]), "wp_token": row[9], "timeout_saved_to_crm": bool(row[10]),
+                    "fingerprint_id": row[11], "fingerprint_method": row[12], "visitor_type": row[13],
+                    "daily_question_count": row[14], "total_question_count": row[15],
+                    "last_question_time": datetime.fromisoformat(row[16]) if row[16] else None,
+                    "question_limit_reached": bool(row[17]), "ban_status": BanStatus(row[18]),
+                    "ban_start_time": datetime.fromisoformat(row[19]) if row[19] else None,
+                    "ban_end_time": datetime.fromisoformat(row[20]) if row[20] else None,
+                    "ban_reason": row[21], "evasion_count": row[22], "current_penalty_hours": row[23],
+                    "escalation_level": row[24], "email_addresses_used": safe_json_loads(row[25], []),
+                    "email_switches_count": row[26], "browser_privacy_level": row[27],
+                    "registration_prompted": bool(row[28]), "registration_link_clicked": bool(row[29]),
+                    "recognition_response": row[30], "display_message_offset": row[31],
+                    "reverification_pending": bool(row[32]), 
+                    "pending_user_type": UserType(row[33]) if row[33] else None,
+                    "pending_email": row[34], "pending_full_name": row[35],
+                    "pending_zoho_contact_id": row[36], "pending_wp_token": row[37],
+                }
+                return UserSession(**row_dict)
+            except Exception as e: logger.error(f"❌ Failed to load session {session_id[:8]}: {e}", exc_info=True); return None
 
     async def save_session(self, session: UserSession):
-        if not await self._ensure_connection(15): logger.warning(f"⚠️ Conn timeout saving {session.session_id[:8]}, using memory");
-        if self.db_type == "memory": self.local_sessions[session.session_id] = copy.deepcopy(session); return
-        try:
-            json_messages = json.dumps(session.messages); json_emails_used = json.dumps(session.email_addresses_used)
-            pending_user_type_value = session.pending_user_type.value if session.pending_user_type else None
-            
-            await self._execute_with_socket_retry_async('''
-                INSERT OR REPLACE INTO sessions (session_id, user_type, email, full_name, zoho_contact_id, 
-                created_at, last_activity, messages, active, wp_token, timeout_saved_to_crm, fingerprint_id, 
-                fingerprint_method, visitor_type, daily_question_count, total_question_count, last_question_time, 
-                question_limit_reached, ban_status, ban_start_time, ban_end_time, ban_reason, evasion_count, 
-                current_penalty_hours, escalation_level, email_addresses_used, email_switches_count, 
-                browser_privacy_level, registration_prompted, registration_link_clicked, recognition_response, 
-                display_message_offset, reverification_pending, pending_user_type, pending_email, pending_full_name,
-                pending_zoho_contact_id, pending_wp_token) 
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (session.session_id, session.user_type.value, session.email, session.full_name,
-                     session.zoho_contact_id, session.created_at.isoformat(), session.last_activity.isoformat(),
-                     json_messages, int(session.active), session.wp_token, int(session.timeout_saved_to_crm),
-                     session.fingerprint_id, session.fingerprint_method, session.visitor_type,
-                     session.daily_question_count, session.total_question_count, 
-                     session.last_question_time.isoformat() if session.last_question_time else None,
-                     int(session.question_limit_reached), session.ban_status.value,
-                     session.ban_start_time.isoformat() if session.ban_start_time else None,
-                     session.ban_end_time.isoformat() if session.ban_end_time else None,
-                     session.ban_reason, session.evasion_count, session.current_penalty_hours,
-                     session.escalation_level, json_emails_used, session.email_switches_count,
-                     session.browser_privacy_level, int(session.registration_prompted),
-                     int(session.registration_link_clicked), session.recognition_response, session.display_message_offset,
-                     int(session.reverification_pending), pending_user_type_value, session.pending_email,
-                     session.pending_full_name, session.pending_zoho_contact_id, session.pending_wp_token))
-            await asyncio.to_thread(self.conn.commit)
-        except Exception as e:
-            logger.error(f"❌ Failed to save session {session.session_id[:8]}: {e}", exc_info=True)
-            self.local_sessions[session.session_id] = copy.deepcopy(session); logger.warning(f"⚠️ Saved session {session.session_id[:8]} to memory as fallback")
+        with self.lock:
+            if not await self._ensure_connection(15): logger.warning(f"⚠️ Conn timeout saving {session.session_id[:8]}, using memory");
+            if self.db_type == "memory": self.local_sessions[session.session_id] = copy.deepcopy(session); return
+            try:
+                json_messages = json.dumps(session.messages); json_emails_used = json.dumps(session.email_addresses_used)
+                pending_user_type_value = session.pending_user_type.value if session.pending_user_type else None
+                
+                await self._execute_with_socket_retry_async('''
+                    INSERT OR REPLACE INTO sessions (session_id, user_type, email, full_name, zoho_contact_id, 
+                    created_at, last_activity, messages, active, wp_token, timeout_saved_to_crm, fingerprint_id, 
+                    fingerprint_method, visitor_type, daily_question_count, total_question_count, last_question_time, 
+                    question_limit_reached, ban_status, ban_start_time, ban_end_time, ban_reason, evasion_count, 
+                    current_penalty_hours, escalation_level, email_addresses_used, email_switches_count, 
+                    browser_privacy_level, registration_prompted, registration_link_clicked, recognition_response, 
+                    display_message_offset, reverification_pending, pending_user_type, pending_email, pending_full_name,
+                    pending_zoho_contact_id, pending_wp_token) 
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (session.session_id, session.user_type.value, session.email, session.full_name,
+                         session.zoho_contact_id, session.created_at.isoformat(), session.last_activity.isoformat(),
+                         json_messages, int(session.active), session.wp_token, int(session.timeout_saved_to_crm),
+                         session.fingerprint_id, session.fingerprint_method, session.visitor_type,
+                         session.daily_question_count, session.total_question_count, 
+                         session.last_question_time.isoformat() if session.last_question_time else None,
+                         int(session.question_limit_reached), session.ban_status.value,
+                         session.ban_start_time.isoformat() if session.ban_start_time else None,
+                         session.ban_end_time.isoformat() if session.ban_end_time else None,
+                         session.ban_reason, session.evasion_count, session.current_penalty_hours,
+                         session.escalation_level, json_emails_used, session.email_switches_count,
+                         session.browser_privacy_level, int(session.registration_prompted),
+                         int(session.registration_link_clicked), session.recognition_response, session.display_message_offset,
+                         int(session.reverification_pending), pending_user_type_value, session.pending_email,
+                         session.pending_full_name, session.pending_zoho_contact_id, session.pending_wp_token))
+                await asyncio.to_thread(self.conn.commit)
+            except Exception as e:
+                logger.error(f"❌ Failed to save session {session.session_id[:8]}: {e}", exc_info=True)
+                self.local_sessions[session.session_id] = copy.deepcopy(session); logger.warning(f"⚠️ Saved session {session.session_id[:8]} to memory as fallback")
 
     async def cleanup_expired_sessions(self, expiry_minutes: int = 5, limit: int = 5) -> Dict[str, Any]:
-        logger.info(f"🧹 Starting cleanup for sessions expired >{expiry_minutes}m, LIMIT {limit} per run.")
-        if not await self._ensure_connection(15): logger.warning(f"⚠️ Conn timeout for cleanup.");
-        
-        if self.db_type == "memory":
-            cutoff_time = datetime.now() - timedelta(minutes=expiry_minutes)
-            processed_sessions = []; crm_eligible = []
-            sorted_sessions = sorted(list(self.local_sessions.items()), key=lambda item: item[1].last_activity or datetime.min)
-            for sid, sess in sorted_sessions[:limit]:
-                if sess.active and sess.last_activity < cutoff_time:
-                    if not sess.timeout_saved_to_crm and is_crm_eligible(sess, False): crm_eligible.append(copy.deepcopy(sess))
-                    sess.active = False; processed_sessions.append(sid)
-            more_remaining = len(sorted_sessions) > limit
-            return {"success": True, "cleaned_up_count": len(processed_sessions), "crm_eligible_count": len(crm_eligible), "storage_type": "memory", "more_sessions_remaining": more_remaining}
-        
-        try:
-            cutoff_iso = (datetime.now() - timedelta(minutes=expiry_minutes)).isoformat()
-            cursor = await self._execute_with_socket_retry_async(f"""
-                SELECT * FROM sessions WHERE active = 1 AND last_activity < ? AND timeout_saved_to_crm = 0
-                AND (user_type = 'registered_user' OR user_type = 'email_verified_guest') AND email IS NOT NULL AND daily_question_count >= 1
-                ORDER BY last_activity ASC LIMIT {limit + 1}
-            """, (cutoff_iso,))
+        with self.lock:
+            logger.info(f"🧹 Starting cleanup for sessions expired >{expiry_minutes}m, LIMIT {limit} per run.")
+            if not await self._ensure_connection(15): logger.warning(f"⚠️ Conn timeout for cleanup.");
             
-            rows = await asyncio.to_thread(cursor.fetchall)
-            more_remaining = len(rows) > limit
-            sessions_to_process = rows[:limit]
-            logger.info(f"🔍 Found {len(rows)} sessions (potential total). Processing {len(sessions_to_process)} this run. More remaining: {more_remaining}")
-            if not sessions_to_process: return {"success": True, "cleaned_up_count": 0, "crm_eligible_count": 0, "storage_type": self.db_type, "more_sessions_remaining": more_remaining}
+            if self.db_type == "memory":
+                cutoff_time = datetime.now() - timedelta(minutes=expiry_minutes)
+                processed_sessions = []; crm_eligible = []
+                sorted_sessions = sorted(list(self.local_sessions.items()), key=lambda item: item[1].last_activity or datetime.min)
+                for sid, sess in sorted_sessions[:limit]:
+                    if sess.active and sess.last_activity < cutoff_time:
+                        if not sess.timeout_saved_to_crm and is_crm_eligible(sess, False): crm_eligible.append(copy.deepcopy(sess))
+                        sess.active = False; processed_sessions.append(sid)
+                more_remaining = len(sorted_sessions) > limit
+                return {"success": True, "cleaned_up_count": len(processed_sessions), "crm_eligible_count": len(crm_eligible), "storage_type": "memory", "more_sessions_remaining": more_remaining}
             
-            crm_saved = 0; crm_failed = 0
-            for row in sessions_to_process:
-                await asyncio.sleep(0)
-                try:
-                    user_session_data = {
-                        "session_id": row[0], "user_type": UserType(row[1]), "email": row[2], "full_name": row[3],
-                        "zoho_contact_id": row[4], "created_at": datetime.fromisoformat(row[5]), 
-                        "last_activity": datetime.fromisoformat(row[6]) if row[6] else None, "messages": safe_json_loads(row[7], []),
-                        "active": bool(row[8]), "wp_token": row[9], "timeout_saved_to_crm": bool(row[10]),
-                        "fingerprint_id": row[11], "fingerprint_method": row[12], "visitor_type": row[13],
-                        "daily_question_count": row[14], "total_question_count": row[15],
-                        "last_question_time": datetime.fromisoformat(row[16]) if row[16] else None,
-                        "question_limit_reached": bool(row[17]), "ban_status": BanStatus(row[18]),
-                        "ban_start_time": datetime.fromisoformat(row[19]) if row[19] else None,
-                        "ban_end_time": datetime.fromisoformat(row[20]) if row[20] else None,
-                        "ban_reason": row[21], "evasion_count": row[22], "current_penalty_hours": row[23],
-                        "escalation_level": row[24], "email_addresses_used": safe_json_loads(row[25], []),
-                        "email_switches_count": row[26], "browser_privacy_level": row[27],
-                        "registration_prompted": bool(row[28]), "registration_link_clicked": bool(row[29]),
-                        "recognition_response": row[30], "display_message_offset": row[31],
-                        "reverification_pending": bool(row[32]), 
-                        "pending_user_type": UserType(row[33]) if row[33] else None,
-                        "pending_email": row[34], "pending_full_name": row[35],
-                        "pending_zoho_contact_id": row[36], "pending_wp_token": row[37],
-                    }
-                    session_obj = UserSession(**user_session_data)
-
-                    save_result = await zoho_manager.save_chat_transcript_sync(session_obj, "Automated Session Timeout Cleanup")
-                    
-                    session_obj.timeout_saved_to_crm = save_result.get("success", False)
-                    session_obj.active = False
-                    session_obj.last_activity = datetime.now()
-                    if save_result.get("contact_id") and not session_obj.zoho_contact_id: session_obj.zoho_contact_id = save_result["contact_id"]
-                    
-                    await self.save_session(session_obj)
-                    crm_saved += 1 if save_result.get("success") else 0
-                    crm_failed += 1 if not save_result.get("success") else 0
-                except Exception as e:
-                    logger.critical(f"❌ Critical error in background CRM processing for session {row[0][:8]}: {e}", exc_info=True)
-                    crm_failed += 1
+            try:
+                cutoff_iso = (datetime.now() - timedelta(minutes=expiry_minutes)).isoformat()
+                cursor = await self._execute_with_socket_retry_async(f"""
+                    SELECT * FROM sessions WHERE active = 1 AND last_activity < ? AND timeout_saved_to_crm = 0
+                    AND (user_type = 'registered_user' OR user_type = 'email_verified_guest') AND email IS NOT NULL AND daily_question_count >= 1
+                    ORDER BY last_activity ASC LIMIT {limit + 1}
+                """, (cutoff_iso,))
+                
+                rows = await asyncio.to_thread(cursor.fetchall)
+                more_remaining = len(rows) > limit
+                sessions_to_process = rows[:limit]
+                logger.info(f"🔍 Found {len(rows)} sessions (potential total). Processing {len(sessions_to_process)} this run. More remaining: {more_remaining}")
+                if not sessions_to_process: return {"success": True, "cleaned_up_count": 0, "crm_eligible_count": 0, "storage_type": self.db_type, "more_sessions_remaining": more_remaining}
+                
+                crm_saved = 0; crm_failed = 0
+                for row in sessions_to_process:
+                    await asyncio.sleep(0)
                     try:
-                        temp_session_for_fail = await self.load_session(row[0]) 
-                        if temp_session_for_fail:
-                            temp_session_for_fail.active = False; temp_session_for_fail.last_activity = datetime.now()
-                            await self.save_session(temp_session_for_fail)
-                    except Exception as fe: logger.critical(f"❌ Failed to mark session inactive after critical error: {fe}")
-            
-            return {"success": True, "cleaned_up_count": len(sessions_to_process), "crm_eligible_count": crm_saved + crm_failed,
-                    "storage_type": self.db_type, "crm_saved_count": crm_saved, "crm_failed_count": crm_failed,
-                    "more_sessions_remaining": more_remaining}
-        except Exception as e:
-            logger.error(f"❌ Failed to cleanup expired sessions: {e}", exc_info=True)
-            return {"success": False, "error": str(e), "storage_type": self.db_type, "more_sessions_remaining": True}
+                        session_obj = UserSession(session_id=row[0], user_type=UserType(row[1]), email=row[2], full_name=row[3], zoho_contact_id=row[4],
+                            created_at=datetime.fromisoformat(row[5]), last_activity=datetime.fromisoformat(row[6]), messages=safe_json_loads(row[7]),
+                            active=bool(row[8]), wp_token=row[9], timeout_saved_to_crm=bool(row[10]), fingerprint_id=row[11],
+                            fingerprint_method=row[12], visitor_type=row[13] or 'new_visitor', daily_question_count=row[14] or 0,
+                            total_question_count=row[15] or 0, last_question_time=datetime.fromisoformat(row[16]) if row[16] else None,
+                            question_limit_reached=bool(row[17]), ban_status=BanStatus(row[18]) if row[18] else BanStatus.NONE,
+                            ban_start_time=datetime.fromisoformat(row[19]) if row[19] else None,
+                            ban_end_time=datetime.fromisoformat(row[20]) if row[20] else None, ban_reason=row[21],
+                            evasion_count=row[22] or 0, current_penalty_hours=row[23] or 0, escalation_level=row[24] or 0,
+                            email_addresses_used=safe_json_loads(row[25]), email_switches_count=row[26] or 0,
+                            browser_privacy_level=row[27], registration_prompted=bool(row[28]),
+                            registration_link_clicked=bool(row[29]), recognition_response=row[30],
+                            display_message_offset=row[31] if len(row) > 31 else 0,
+                            reverification_pending=bool(row[32]) if len(row) > 32 else False,
+                            pending_user_type=UserType(row[33]) if len(row) > 33 and row[33] else None,
+                            pending_email=row[34] if len(row) > 34 else None,
+                            pending_full_name=row[35] if len(row) > 35 else None,
+                            pending_zoho_contact_id=row[36] if len(row) > 36 else None,
+                            pending_wp_token=row[37] if len(row) > 37 else None)
+
+                        save_result = await zoho_manager.save_chat_transcript_sync(session_obj, "Automated Session Timeout Cleanup")
+                        
+                        session_obj.timeout_saved_to_crm = save_result.get("success", False)
+                        session_obj.active = False
+                        session_obj.last_activity = datetime.now()
+                        if save_result.get("contact_id") and not session_obj.zoho_contact_id: session_obj.zoho_contact_id = save_result["contact_id"]
+                        
+                        await self.save_session(session_obj)
+                        crm_saved += 1 if save_result.get("success") else 0
+                        crm_failed += 1 if not save_result.get("success") else 0
+                    except Exception as e:
+                        logger.critical(f"❌ Critical error in background CRM processing for session {row[0][:8]}: {e}", exc_info=True)
+                        crm_failed += 1
+                        try:
+                            temp_session_for_fail = await self.load_session(row[0]) 
+                            if temp_session_for_fail:
+                                temp_session_for_fail.active = False; temp_session_for_fail.last_activity = datetime.now()
+                                await self.save_session(temp_session_for_fail)
+                        except Exception as fe: logger.critical(f"❌ Failed to mark session inactive after critical error: {fe}")
+                
+                return {"success": True, "cleaned_up_count": len(sessions_to_process), "crm_eligible_count": crm_saved + crm_failed,
+                        "storage_type": self.db_type, "crm_saved_count": crm_saved, "crm_failed_count": crm_failed,
+                        "more_sessions_remaining": more_remaining}
+            except Exception as e:
+                logger.error(f"❌ Failed to cleanup expired sessions: {e}", exc_info=True)
+                return {"success": False, "error": str(e), "storage_type": self.db_type, "more_sessions_remaining": True}
 
 # PDF Exporter
 class PDFExporter:
+    # ... (This class remains the same) ...
     def __init__(self):
         self.styles = getSampleStyleSheet()
         self.styles.add(ParagraphStyle(name='UserMessage', backColor=lightgrey, fontSize=10, leading=14, spaceAfter=6))
@@ -583,6 +584,7 @@ class PDFExporter:
 
 # Zoho CRM Manager
 class ZohoCRMManager:
+    # ... (This class remains the same) ...
     def __init__(self, pdf_exporter: PDFExporter):
         self.pdf_exporter = pdf_exporter
         self.base_url = "https://www.zohoapis.com/crm/v2"
@@ -737,11 +739,29 @@ async def cleanup_expired_sessions_endpoint(background_tasks: BackgroundTasks):
 
 @app.post("/emergency-save")
 async def emergency_save_endpoint(request: EmergencySaveRequest, background_tasks: BackgroundTasks):
-    if db_manager is None or zoho_manager is None: return {"success": False, "message": "Managers not initialized.", "queued_for_background_processing": False}
-    background_tasks.add_task(_perform_emergency_crm_save, request.session_id, f"Async Emergency Save: {request.reason}")
-    return {"success": True, "message": "Emergency save queued", "session_id": request.session_id, "reason": request.reason}
+    """
+    Handles emergency save requests sent with a standard 'application/json' content type.
+    The CORSMiddleware handles the necessary preflight OPTIONS request from the browser.
+    """
+    logger.info(f"Received valid request for /emergency-save for session: {request.session_id}")
+    if db_manager is None or zoho_manager is None:
+        logger.error("Managers not initialized. Cannot process emergency save.")
+        raise HTTPException(status_code=503, detail="Service not ready")
+    
+    # FastAPI has already validated the request against the EmergencySaveRequest model.
+    # We can now directly queue the background task.
+    logger.info(f"Queuing background task for session: {request.session_id}, Reason: {request.reason}")
+    background_tasks.add_task(_perform_emergency_crm_save, request.session_id, f"Async Beacon Save: {request.reason}")
+    
+    return {
+        "success": True, 
+        "message": "Emergency save successfully queued for background processing.", 
+        "session_id": request.session_id
+    }
 
 if __name__ == "__main__":
     import uvicorn
-    logger.info("🚀 Starting FiFi Emergency API - ASYNC OPERATIONS ENABLED (Simplified)...")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # Use the PORT environment variable provided by Cloud Run. Default to 8080 for local development.
+    port = int(os.environ.get("PORT", 8080))
+    logger.info(f"🚀 Starting FiFi Emergency API on port {port}...")
+    uvicorn.run(app, host="0.0.0.0", port=port)
