@@ -17,7 +17,7 @@ from collections import defaultdict
 import io
 import html
 import re
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.platypus import SimpleDocDocument, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.colors import lightgrey
@@ -153,6 +153,25 @@ def safe_json_loads(data: Optional[str], default_value: Any = None) -> Any:
     except (json.JSONDecodeError, TypeError):
         logger.warning(f"Failed to decode JSON data: {str(data)[:100]}...")
         return default_value
+
+# FIX #2: Add safe datetime parsing function
+def safe_parse_datetime(value):
+    """
+    Safely parse datetime values from various data types
+    """
+    if not value:
+        return None
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value)
+        except (ValueError, TypeError) as e:
+            logger.warning(f"Failed to parse datetime string '{value}': {e}")
+            return None
+    elif isinstance(value, datetime):
+        return value
+    else:
+        logger.warning(f"Unexpected datetime type: {type(value)} - {value}")
+        return None
 
 def is_session_ending_reason(reason: str) -> bool:
     session_ending_keywords = ['beforeunload', 'unload', 'close', 'refresh', 'timeout', 'parent_beforeunload', 'browser_close', 'tab_close', 'window_close', 'page_refresh', 'browser_refresh', 'session_timeout', 'inactivity']
@@ -423,10 +442,10 @@ class ResilientDatabaseManager:
                     "active": bool(row[8]), "wp_token": row[9], "timeout_saved_to_crm": bool(row[10]),
                     "fingerprint_id": row[11], "fingerprint_method": row[12], "visitor_type": row[13],
                     "daily_question_count": row[14], "total_question_count": row[15],
-                    "last_question_time": datetime.fromisoformat(row[16]) if row[16] else None,
+                    "last_question_time": safe_parse_datetime(row[16]),  # FIXED LINE
                     "question_limit_reached": bool(row[17]), "ban_status": BanStatus(row[18]),
-                    "ban_start_time": datetime.fromisoformat(row[19]) if row[19] else None,
-                    "ban_end_time": datetime.fromisoformat(row[20]) if row[20] else None,
+                    "ban_start_time": safe_parse_datetime(row[19]),  # FIXED LINE
+                    "ban_end_time": safe_parse_datetime(row[20]),  # FIXED LINE
                     "ban_reason": row[21], "evasion_count": row[22], "current_penalty_hours": row[23],
                     "escalation_level": row[24], "email_addresses_used": safe_json_loads(row[25], []),
                     "email_switches_count": row[26], "browser_privacy_level": row[27],
@@ -501,18 +520,19 @@ class ResilientDatabaseManager:
                 for row in sessions_to_process:
                     await asyncio.sleep(0)
                     try:
-                        # FIX #2: Add safety checks for all datetime conversions
+                        # FIX #3: Updated session_data creation with safe datetime parsing
                         session_data = {
                             "session_id": row[0], "user_type": UserType(row[1]), "email": row[2], "full_name": row[3],
-                            "zoho_contact_id": row[4], "created_at": datetime.fromisoformat(row[5]) if row[5] else datetime.now(), 
-                            "last_activity": datetime.fromisoformat(row[6]) if row[6] else datetime.now(), 
+                            "zoho_contact_id": row[4], 
+                            "created_at": safe_parse_datetime(row[5]) or datetime.now(), 
+                            "last_activity": safe_parse_datetime(row[6]) or datetime.now(), 
                             "messages": safe_json_loads(row[7], []), "active": bool(row[8]), "wp_token": row[9], 
                             "timeout_saved_to_crm": bool(row[10]), "fingerprint_id": row[11], "fingerprint_method": row[12], 
                             "visitor_type": row[13], "daily_question_count": row[14], "total_question_count": row[15],
-                            "last_question_time": datetime.fromisoformat(row[16]) if row[16] else None,
+                            "last_question_time": safe_parse_datetime(row[16]),  # MAIN FIX: Use safe_parse_datetime
                             "question_limit_reached": bool(row[17]), "ban_status": BanStatus(row[18]),
-                            "ban_start_time": datetime.fromisoformat(row[19]) if row[19] else None,
-                            "ban_end_time": datetime.fromisoformat(row[20]) if row[20] else None,
+                            "ban_start_time": safe_parse_datetime(row[19]),  # FIXED
+                            "ban_end_time": safe_parse_datetime(row[20]),  # FIXED
                             "ban_reason": row[21], "evasion_count": row[22], "current_penalty_hours": row[23],
                             "escalation_level": row[24], "email_addresses_used": safe_json_loads(row[25], []),
                             "email_switches_count": row[26], "browser_privacy_level": row[27],
@@ -546,7 +566,6 @@ class ResilientDatabaseManager:
 
 # PDF Exporter
 class PDFExporter:
-    # ... (This class remains the same) ...
     def __init__(self):
         self.styles = getSampleStyleSheet()
         self.styles.add(ParagraphStyle(name='UserMessage', backColor=lightgrey, fontSize=10, leading=14, spaceAfter=6))
@@ -567,7 +586,6 @@ class PDFExporter:
 
 # Zoho CRM Manager
 class ZohoCRMManager:
-    # ... (This class remains the same) ...
     def __init__(self, pdf_exporter: PDFExporter):
         self.pdf_exporter = pdf_exporter
         self.base_url = "https://www.zohoapis.com/crm/v2"
@@ -691,7 +709,7 @@ async def root():
     return {
         "message": "FiFi Emergency API - Async Operations Enabled (Simplified)",
         "status": "running",
-        "version": "3.6.0-simplified",
+        "version": "3.8.2-final-fix",
         "info": "Consolidated & streamlined for clarity while maintaining core functionality & robustness."
     }
 
@@ -707,7 +725,7 @@ async def health_check():
 async def comprehensive_diagnostics():
     if db_manager is None or zoho_manager is None: return {"status": "initializing", "message": "Managers not initialized.", "timestamp": datetime.now()}
     try:
-        diagnostics = {"timestamp": datetime.now(), "version": "3.6.0-simplified"}
+        diagnostics = {"timestamp": datetime.now(), "version": "3.8.2-final-fix"}
         diagnostics["database_status"] = await db_manager.test_connection()
         diagnostics["zoho_enabled"] = ZOHO_ENABLED
         diagnostics["sqlitecloud_sdk_available"] = SQLITECLOUD_AVAILABLE
