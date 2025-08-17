@@ -28,12 +28,12 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # FastAPI app initialization
-app = FastAPI(title="FiFi Emergency API - Async Operations", version="3.8.1-final")
+app = FastAPI(title="FiFi Emergency API - Async Operations", version="3.8.2-final-fix")
 
-# CORS middleware
+# CORS middleware - This is the complete and correct way to handle CORS.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://fifi-eu.streamlit.app", "*"],
+    allow_origins=["https://fifi-eu.streamlit.app", "*"],  # Consider restricting "*" in production
     allow_credentials=True,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
@@ -158,7 +158,7 @@ def is_session_ending_reason(reason: str) -> bool:
     session_ending_keywords = ['beforeunload', 'unload', 'close', 'refresh', 'timeout', 'parent_beforeunload', 'browser_close', 'tab_close', 'window_close', 'page_refresh', 'browser_refresh', 'session_timeout', 'inactivity']
     return any(keyword in reason.lower() for keyword in session_ending_keywords)
 
-# Resilient Database Manager (restored from your old working code)
+# Resilient Database Manager
 class ResilientDatabaseManager:
     def __init__(self, connection_string: Optional[str]):
         self.lock = threading.Lock()
@@ -484,7 +484,6 @@ class ResilientDatabaseManager:
             if not await self._ensure_connection(15): logger.warning(f"⚠️ Conn timeout for cleanup."); return {"success": False, "reason": "db_connection_failed"}
             
             if self.db_type == "memory":
-                # Handle in-memory cleanup logic
                 return {"success": True, "cleaned_up_count": 0, "storage_type": "memory"}
             
             try:
@@ -547,6 +546,7 @@ class ResilientDatabaseManager:
 
 # PDF Exporter
 class PDFExporter:
+    # ... (This class remains the same) ...
     def __init__(self):
         self.styles = getSampleStyleSheet()
         self.styles.add(ParagraphStyle(name='UserMessage', backColor=lightgrey, fontSize=10, leading=14, spaceAfter=6))
@@ -567,6 +567,7 @@ class PDFExporter:
 
 # Zoho CRM Manager
 class ZohoCRMManager:
+    # ... (This class remains the same) ...
     def __init__(self, pdf_exporter: PDFExporter):
         self.pdf_exporter = pdf_exporter
         self.base_url = "https://www.zohoapis.com/crm/v2"
