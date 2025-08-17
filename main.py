@@ -17,7 +17,7 @@ from collections import defaultdict
 import io
 import html
 import re
-from reportlab.platypus import SimpleDocDocument, Paragraph, Spacer
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.colors import lightgrey
