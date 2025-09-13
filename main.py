@@ -891,6 +891,47 @@ async def emergency_save_endpoint(request: EmergencySaveRequest, background_task
     background_tasks.add_task(_perform_emergency_crm_save, request.session_id, f"Async Emergency Save: {request.reason}")
     return {"success": True, "message": "Emergency save queued", "session_id": request.session_id, "reason": request.reason}
 
+# --- NEW FINGERPRINT ENDPOINT ---
+@app.post("/fingerprint")
+async def receive_fingerprint(payload: FingerprintPayload):
+    """
+    Receives fingerprint data from the client, finds the corresponding session,
+    and updates it directly in the database.
+    """
+    logger.info(f"Received fingerprint for session: {payload.session_id[:8]}")
+    
+    if not db_manager:
+        logger.error("Database manager not initialized.")
+        raise HTTPException(status_code=503, detail="Service not ready")
+        
+    try:
+        # Load the session from the database
+        session = await db_manager.load_session(payload.session_id)
+        
+        if not session:
+            logger.error(f"Session not found in DB: {payload.session_id}")
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        # Update the session object in memory with the new fingerprint data
+        session.fingerprint_id = payload.fingerprint_id
+        session.fingerprint_method = payload.method
+        session.browser_privacy_level = payload.privacy
+        
+        # Here you could add inheritance logic if needed, but for simplicity,
+        # we'll let the Streamlit app handle that on the next load.
+        # This keeps the beacon's job minimal: just save the data.
+        
+        # Save the updated session back to the database
+        await db_manager.save_session(session)
+        
+        logger.info(f"✅ Successfully updated fingerprint for session {payload.session_id[:8]}")
+        
+        return {"status": "success", "message": "Fingerprint updated."}
+
+    except Exception as e:
+        logger.error(f"❌ Failed to process fingerprint for session {payload.session_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error while processing fingerprint")
+
 if __name__ == "__main__":
     import uvicorn
     logger.info("🚀 Starting FiFi Emergency API - ASYNC OPERATIONS ENABLED (Simplified)...")
