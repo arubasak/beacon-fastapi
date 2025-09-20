@@ -35,7 +35,7 @@ app = FastAPI(title="FiFi Backend API", version="4.0.1")
 # CORS middleware for Streamlit frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://fifi-eu.streamlit.app", "*"], # Allows specific origin and wildcard for flexibility
+    allow_origins=["https://fifi-eu.streamlit.app", "*"],
     allow_credentials=True,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
@@ -59,9 +59,9 @@ except ImportError:
     logger.warning("❌ SQLiteCloud SDK not available. Local file/memory fallback will be used.")
 
 # Global managers (initialized during startup)
-db_manager: 'ResilientDatabaseManager' = None
-pdf_exporter: 'PDFExporter' = None
-zoho_manager: 'ZohoCRMManager' = None
+db_manager = None
+pdf_exporter = None
+zoho_manager = None
 
 # --- 2. Pydantic Models & Data Classes ---
 
@@ -75,7 +75,7 @@ class FingerprintPayload(BaseModel):
     fingerprint_id: str
     method: str
     privacy: str
-    working_methods: List[str] # Included from reference for future use
+    working_methods: List[str]
 
 class UserType(Enum):
     GUEST = "guest"
@@ -129,7 +129,6 @@ class UserSession:
     pending_full_name: Optional[str] = None
     pending_zoho_contact_id: Optional[str] = None
     pending_wp_token: Optional[str] = None
-    # New fields from reference code
     declined_recognized_email_at: Optional[datetime] = None
     timeout_detected_at: Optional[datetime] = None
     timeout_reason: Optional[str] = None
@@ -156,7 +155,7 @@ class ResilientDatabaseManager:
     def __init__(self, connection_string: Optional[str]):
         self.conn = None
         self.connection_string = connection_string
-        self.db_type = "memory" # Start in memory mode until a connection is proven
+        self.db_type = "memory"
         self.local_sessions = {}
         self._initialized_schema = False
         logger.info("🔄 ResilientDatabaseManager initialized (will connect on first use).")
@@ -166,7 +165,7 @@ class ResilientDatabaseManager:
         if self.conn and self.db_type != "memory":
             try:
                 await asyncio.to_thread(self.conn.execute, "SELECT 1")
-                return # Connection is healthy
+                return
             except Exception:
                 logger.warning("⚠️ Database connection health check failed. Reconnecting...")
                 self.conn = None
@@ -185,8 +184,6 @@ class ResilientDatabaseManager:
         # Fallback to local file if cloud fails or is not configured
         if not self.conn:
             try:
-                # IMPORTANT: Local file storage is ephemeral on Cloud Run and not suitable for production.
-                # It is retained here for local development and testing purposes.
                 self.conn = sqlite3.connect("fifi_sessions_emergency.db", check_same_thread=False)
                 self.db_type = "file"
                 logger.warning("⚠️ Connected to local SQLite file as a fallback.")
@@ -197,7 +194,7 @@ class ResilientDatabaseManager:
         # Ultimate fallback: in-memory dictionary
         if not self.conn:
             self.db_type = "memory"
-            self._initialized_schema = True # In-memory doesn't need schema init
+            self._initialized_schema = True
             logger.error("🚨 CRITICAL: No persistent DB connection. Operating in IN-MEMORY mode.")
             return
 
@@ -244,9 +241,9 @@ class ResilientDatabaseManager:
             try:
                 cursor.execute(f"ALTER TABLE sessions ADD COLUMN {col_name} {col_type}")
                 logger.info(f"Added column: {col_name}")
-            except (sqlite3.OperationalError, getattr(sqlitecloud.exceptions, 'SQLiteCloudException', sqlite3.OperationalError)) as e:
+            except Exception as e:
                 if "duplicate column name" in str(e).lower() or "already exists" in str(e).lower():
-                    pass # Column already exists, which is fine
+                    pass
                 else:
                     raise e
         
@@ -355,28 +352,44 @@ class ResilientDatabaseManager:
             return
         
         session_dict = {
-            "session_id": session.session_id, "user_type": session.user_type.value, "email": session.email,
-            "full_name": session.full_name, "zoho_contact_id": session.zoho_contact_id,
-            "created_at": session.created_at.isoformat(), "last_activity": session.last_activity.isoformat(),
-            "messages": json.dumps(session.messages), "active": int(session.active), "wp_token": session.wp_token,
-            "timeout_saved_to_crm": int(session.timeout_saved_to_crm), "fingerprint_id": session.fingerprint_id,
-            "fingerprint_method": session.fingerprint_method, "visitor_type": session.visitor_type,
-            "daily_question_count": session.daily_question_count, "total_question_count": session.total_question_count,
+            "session_id": session.session_id,
+            "user_type": session.user_type.value,
+            "email": session.email,
+            "full_name": session.full_name,
+            "zoho_contact_id": session.zoho_contact_id,
+            "created_at": session.created_at.isoformat(),
+            "last_activity": session.last_activity.isoformat(),
+            "messages": json.dumps(session.messages),
+            "active": int(session.active),
+            "wp_token": session.wp_token,
+            "timeout_saved_to_crm": int(session.timeout_saved_to_crm),
+            "fingerprint_id": session.fingerprint_id,
+            "fingerprint_method": session.fingerprint_method,
+            "visitor_type": session.visitor_type,
+            "daily_question_count": session.daily_question_count,
+            "total_question_count": session.total_question_count,
             "last_question_time": session.last_question_time.isoformat() if session.last_question_time else None,
-            "question_limit_reached": int(session.question_limit_reached), "ban_status": session.ban_status.value,
+            "question_limit_reached": int(session.question_limit_reached),
+            "ban_status": session.ban_status.value,
             "ban_start_time": session.ban_start_time.isoformat() if session.ban_start_time else None,
             "ban_end_time": session.ban_end_time.isoformat() if session.ban_end_time else None,
-            "ban_reason": session.ban_reason, "evasion_count": session.evasion_count,
-            "current_penalty_hours": session.current_penalty_hours, "escalation_level": session.escalation_level,
+            "ban_reason": session.ban_reason,
+            "evasion_count": session.evasion_count,
+            "current_penalty_hours": session.current_penalty_hours,
+            "escalation_level": session.escalation_level,
             "email_addresses_used": json.dumps(session.email_addresses_used),
-            "email_switches_count": session.email_switches_count, "browser_privacy_level": session.browser_privacy_level,
+            "email_switches_count": session.email_switches_count,
+            "browser_privacy_level": session.browser_privacy_level,
             "registration_prompted": int(session.registration_prompted),
             "registration_link_clicked": int(session.registration_link_clicked),
-            "recognition_response": session.recognition_response, "display_message_offset": session.display_message_offset,
+            "recognition_response": session.recognition_response,
+            "display_message_offset": session.display_message_offset,
             "reverification_pending": int(session.reverification_pending),
             "pending_user_type": session.pending_user_type.value if session.pending_user_type else None,
-            "pending_email": session.pending_email, "pending_full_name": session.pending_full_name,
-            "pending_zoho_contact_id": session.pending_zoho_contact_id, "pending_wp_token": session.pending_wp_token,
+            "pending_email": session.pending_email,
+            "pending_full_name": session.pending_full_name,
+            "pending_zoho_contact_id": session.pending_zoho_contact_id,
+            "pending_wp_token": session.pending_wp_token,
             "declined_recognized_email_at": session.declined_recognized_email_at.isoformat() if session.declined_recognized_email_at else None,
             "timeout_detected_at": session.timeout_detected_at.isoformat() if session.timeout_detected_at else None,
             "timeout_reason": session.timeout_reason
@@ -401,8 +414,8 @@ class ResilientDatabaseManager:
         logger.info(f"🧹 Starting cleanup for sessions inactive for >{expiry_minutes}m.")
         await self._ensure_connection()
         if self.db_type == "memory":
-             logger.warning("Cleanup skipped: in-memory mode does not support automated cleanup.")
-             return {"success": False, "reason": "in_memory_mode"}
+            logger.warning("Cleanup skipped: in-memory mode does not support automated cleanup.")
+            return {"success": False, "reason": "in_memory_mode"}
         
         cutoff_iso = (datetime.now() - timedelta(minutes=expiry_minutes)).isoformat()
         try:
@@ -445,7 +458,13 @@ class PDFExporter:
     """Generates PDF chat transcripts."""
     def __init__(self):
         self.styles = getSampleStyleSheet()
-        self.styles.add(ParagraphStyle(name='UserMessage', backColor=lightgrey, fontSize=10, leading=14, spaceAfter=6))
+        self.styles.add(ParagraphStyle(
+            name='UserMessage',
+            backColor=lightgrey,
+            fontSize=10,
+            leading=14,
+            spaceAfter=6
+        ))
 
     async def generate_chat_pdf(self, session: UserSession) -> Optional[io.BytesIO]:
         try:
@@ -460,7 +479,7 @@ class PDFExporter:
             ]
             for msg in session.messages:
                 content = html.escape(str(msg.get('content', '')))
-                content = re.sub(r'<[^>]+>', '', content) # Strip HTML tags
+                content = re.sub(r'<[^>]+>', '', content)
                 role = msg.get('role', 'unknown').capitalize()
                 style = self.styles['UserMessage'] if role == 'User' else self.styles['Normal']
                 story.extend([Spacer(1, 8), Paragraph(f"<b>{role}:</b> {content}", style)])
@@ -482,7 +501,8 @@ class ZohoCRMManager:
         self._http_client = httpx.AsyncClient(timeout=30)
 
     async def _get_access_token(self) -> Optional[str]:
-        if not ZOHO_ENABLED: return None
+        if not ZOHO_ENABLED:
+            return None
         if self._access_token and self._token_expiry and datetime.now() < self._token_expiry:
             return self._access_token
         try:
@@ -508,14 +528,20 @@ class ZohoCRMManager:
 
     async def _find_or_create_contact(self, session: UserSession) -> Optional[str]:
         """Finds a contact by email or creates a new one."""
-        if not session.email: return None
+        if not session.email:
+            return None
         token = await self._get_access_token()
-        if not token: return None
+        if not token:
+            return None
         headers = {'Authorization': f'Zoho-oauthtoken {token}'}
         
         # Search for existing contact
         try:
-            search_res = await self._http_client.get(f"{self.base_url}/Contacts/search", headers=headers, params={'email': session.email})
+            search_res = await self._http_client.get(
+                f"{self.base_url}/Contacts/search",
+                headers=headers,
+                params={'email': session.email}
+            )
             if search_res.status_code == 200 and search_res.json().get('data'):
                 return search_res.json()['data'][0]['id']
         except Exception as e:
@@ -523,13 +549,17 @@ class ZohoCRMManager:
 
         # Create new contact if not found
         try:
-            create_res = await self._http_client.post(f"{self.base_url}/Contacts", headers=headers, json={
-                "data": [{
-                    "Last_Name": session.full_name or "Food Professional",
-                    "Email": session.email,
-                    "Lead_Source": "FiFi AI Chat"
-                }]
-            })
+            create_res = await self._http_client.post(
+                f"{self.base_url}/Contacts",
+                headers=headers,
+                json={
+                    "data": [{
+                        "Last_Name": session.full_name or "Food Professional",
+                        "Email": session.email,
+                        "Lead_Source": "FiFi AI Chat"
+                    }]
+                }
+            )
             create_res.raise_for_status()
             return create_res.json()['data'][0]['details']['id']
         except Exception as e:
@@ -538,17 +568,22 @@ class ZohoCRMManager:
 
     async def save_chat_transcript(self, session: UserSession, trigger_reason: str) -> Dict[str, Any]:
         """Saves a chat transcript as a PDF attachment and a note in Zoho CRM."""
-        if not ZOHO_ENABLED: return {"success": False, "reason": "zoho_disabled"}
-        if not is_crm_eligible(session): return {"success": False, "reason": "not_eligible"}
+        if not ZOHO_ENABLED:
+            return {"success": False, "reason": "zoho_disabled"}
+        if not is_crm_eligible(session):
+            return {"success": False, "reason": "not_eligible"}
 
         contact_id = session.zoho_contact_id or await self._find_or_create_contact(session)
-        if not contact_id: return {"success": False, "reason": "contact_failed"}
+        if not contact_id:
+            return {"success": False, "reason": "contact_failed"}
 
         pdf_buffer = await self.pdf_exporter.generate_chat_pdf(session)
-        if not pdf_buffer: return {"success": False, "reason": "pdf_generation_failed"}
+        if not pdf_buffer:
+            return {"success": False, "reason": "pdf_generation_failed"}
         
         token = await self._get_access_token()
-        if not token: return {"success": False, "reason": "auth_failed"}
+        if not token:
+            return {"success": False, "reason": "auth_failed"}
         
         # Upload PDF as attachment
         try:
@@ -593,9 +628,9 @@ async def _perform_emergency_crm_save(session_id: str, reason: str):
     session.last_activity = datetime.now()
     session.timeout_saved_to_crm = save_result.get("success", False)
     if is_session_ending_reason(reason):
-        session.active = False # Deactivate session on browser close/timeout
+        session.active = False
     if save_result.get("contact_id") and not session.zoho_contact_id:
-        session.zoho_contact_id = save_result["contact_id"] # Update session with new Zoho ID
+        session.zoho_contact_id = save_result["contact_id"]
     
     await db_manager.save_session(session)
     logger.info(f"Background task finished for {session_id[:8]}. Success: {save_result.get('success')}")
@@ -619,7 +654,6 @@ async def startup_event():
     await db_manager.test_connection()
     logger.info(f"✅ FastAPI startup complete. DB Mode: {db_manager.db_type}, Zoho Enabled: {ZOHO_ENABLED}")
 
-# OPTIONS handlers for CORS preflight requests
 @app.options("/{path:path}")
 async def options_handler(path: str):
     return {"status": "ok"}
@@ -636,19 +670,30 @@ async def root():
 @app.get("/health")
 async def health_check():
     db_status = await db_manager.test_connection()
-    return {"status": "healthy", "timestamp": datetime.now(), "database": db_status}
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now(),
+        "database": db_status
+    }
 
 @app.post("/emergency-save")
-async def emergency_save_endpoint(request: EmergenceSaveRequest, background_tasks: BackgroundTasks):
+async def emergency_save_endpoint(request: EmergencySaveRequest, background_tasks: BackgroundTasks):
     """Queues a background task to save a chat session to the CRM upon user exit."""
     background_tasks.add_task(_perform_emergency_crm_save, request.session_id, request.reason)
-    return {"success": True, "message": "Emergency save queued.", "session_id": request.session_id}
+    return {
+        "success": True,
+        "message": "Emergency save queued.",
+        "session_id": request.session_id
+    }
 
 @app.post("/cleanup-expired-sessions")
 async def cleanup_expired_sessions_endpoint(background_tasks: BackgroundTasks):
     """Queues a background task to find and process inactive sessions."""
     background_tasks.add_task(_perform_full_cleanup_in_background)
-    return {"success": True, "message": "Cleanup task queued."}
+    return {
+        "success": True,
+        "message": "Cleanup task queued."
+    }
 
 @app.post("/fingerprint")
 async def receive_fingerprint(payload: FingerprintPayload):
@@ -673,7 +718,10 @@ async def receive_fingerprint(payload: FingerprintPayload):
         
         await db_manager.save_session(session)
         logger.info(f"✅ Successfully updated fingerprint for session {payload.session_id[:8]}")
-        return {"status": "success", "message": "Fingerprint data received and updated."}
+        return {
+            "status": "success",
+            "message": "Fingerprint data received and updated."
+        }
 
     except Exception as e:
         logger.error(f"❌ Failed to process fingerprint for session {payload.session_id}: {e}", exc_info=True)
