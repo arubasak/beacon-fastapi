@@ -1,6 +1,6 @@
 # main.py - Consolidated FiFi Backend API
 # Serves as a beacon for emergency saves, session cleanup, and fingerprinting.
-# Version: 4.0.0 (Consolidated)
+# Version: 4.0.1 (Fixed SQLiteCloud compatibility)
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel
@@ -30,7 +30,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # FastAPI app initialization
-app = FastAPI(title="FiFi Backend API", version="4.0.0")
+app = FastAPI(title="FiFi Backend API", version="4.0.1")
 
 # CORS middleware for Streamlit frontend
 app.add_middleware(
@@ -244,7 +244,7 @@ class ResilientDatabaseManager:
             try:
                 cursor.execute(f"ALTER TABLE sessions ADD COLUMN {col_name} {col_type}")
                 logger.info(f"Added column: {col_name}")
-            except (sqlite3.OperationalError, getattr(sqlitecloud.exceptions, 'SQLiteCloudOperationalError', sqlite3.OperationalError)) as e:
+            except (sqlite3.OperationalError, getattr(sqlitecloud.exceptions, 'SQLiteCloudException', sqlite3.OperationalError)) as e:
                 if "duplicate column name" in str(e).lower() or "already exists" in str(e).lower():
                     pass # Column already exists, which is fine
                 else:
@@ -258,8 +258,24 @@ class ResilientDatabaseManager:
         await self._ensure_connection()
         return {"db_type": self.db_type, "schema_initialized": self._initialized_schema}
 
+    def _row_to_dict(self, cursor, row) -> Dict[str, Any]:
+        """Convert a database row to a dictionary, handling both SQLite and SQLiteCloud."""
+        if row is None:
+            return None
+            
+        if self.db_type == "cloud":
+            # SQLiteCloud returns tuples, use cursor.description
+            columns = [desc[0] for desc in cursor.description]
+            return dict(zip(columns, row))
+        else:
+            # Regular SQLite with row_factory returns sqlite3.Row objects
+            return dict(row)
+
     def _build_session_from_row(self, row_dict: Dict) -> UserSession:
         """Helper method to build UserSession object from a dictionary-like database row."""
+        if not row_dict:
+            return None
+            
         return UserSession(
             session_id=row_dict.get('session_id'),
             user_type=UserType(row_dict['user_type']) if row_dict.get('user_type') else UserType.GUEST,
@@ -309,15 +325,25 @@ class ResilientDatabaseManager:
         if self.db_type == "memory":
             return copy.deepcopy(self.local_sessions.get(session_id))
         try:
-            self.conn.row_factory = sqlite3.Row
+            # Set row factory only for regular SQLite, not SQLiteCloud
+            if self.db_type == "file":
+                self.conn.row_factory = sqlite3.Row
+                
             cursor = await asyncio.to_thread(
                 self.conn.execute,
                 "SELECT * FROM sessions WHERE session_id = ? AND active = 1",
                 (session_id,)
             )
             row = await asyncio.to_thread(cursor.fetchone)
-            self.conn.row_factory = None # Reset row factory
-            return self._build_session_from_row(dict(row)) if row else None
+            
+            # Convert row to dict based on db type
+            row_dict = self._row_to_dict(cursor, row)
+            
+            # Reset row factory if we set it
+            if self.db_type == "file":
+                self.conn.row_factory = None
+                
+            return self._build_session_from_row(row_dict) if row_dict else None
         except Exception as e:
             logger.error(f"❌ Failed to load session {session_id[:8]}: {e}", exc_info=True)
             return None
@@ -380,18 +406,25 @@ class ResilientDatabaseManager:
         
         cutoff_iso = (datetime.now() - timedelta(minutes=expiry_minutes)).isoformat()
         try:
-            self.conn.row_factory = sqlite3.Row
+            # Set row factory only for regular SQLite
+            if self.db_type == "file":
+                self.conn.row_factory = sqlite3.Row
+                
             cursor = await asyncio.to_thread(
                 self.conn.execute,
                 "SELECT * FROM sessions WHERE active = 1 AND last_activity < ? ORDER BY last_activity ASC LIMIT ?",
                 (cutoff_iso, limit)
             )
             rows = await asyncio.to_thread(cursor.fetchall)
-            self.conn.row_factory = None
+            
+            # Reset row factory
+            if self.db_type == "file":
+                self.conn.row_factory = None
             
             cleaned_count = 0
             for row in rows:
-                session = self._build_session_from_row(dict(row))
+                row_dict = self._row_to_dict(cursor, row)
+                session = self._build_session_from_row(row_dict)
                 
                 if is_crm_eligible(session):
                     # Save to CRM before deactivating
@@ -606,7 +639,7 @@ async def health_check():
     return {"status": "healthy", "timestamp": datetime.now(), "database": db_status}
 
 @app.post("/emergency-save")
-async def emergency_save_endpoint(request: EmergencySaveRequest, background_tasks: BackgroundTasks):
+async def emergency_save_endpoint(request: EmergenceSaveRequest, background_tasks: BackgroundTasks):
     """Queues a background task to save a chat session to the CRM upon user exit."""
     background_tasks.add_task(_perform_emergency_crm_save, request.session_id, request.reason)
     return {"success": True, "message": "Emergency save queued.", "session_id": request.session_id}
