@@ -1,6 +1,6 @@
 # main.py - Consolidated FiFi Backend API
 # Serves as a beacon for emergency saves, session cleanup, and fingerprinting.
-# Version: 4.0.1 (Fixed SQLiteCloud compatibility)
+# Version: 4.0.2 (Fixed SQLiteCloud connection resilience)
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel
@@ -30,7 +30,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # FastAPI app initialization
-app = FastAPI(title="FiFi Backend API", version="4.0.1")
+app = FastAPI(title="FiFi Backend API", version="4.0.2")
 
 # CORS middleware for Streamlit frontend
 app.add_middleware(
@@ -158,16 +158,31 @@ class ResilientDatabaseManager:
         self.db_type = "memory"
         self.local_sessions = {}
         self._initialized_schema = False
+        self._last_connection_time = None
+        self._connection_timeout = 300  # 5 minutes
         logger.info("🔄 ResilientDatabaseManager initialized (will connect on first use).")
 
     async def _ensure_connection(self):
         """Ensure a valid database connection exists, trying cloud, then local file, then memory."""
+        # Check if we need to refresh connection (for SQLiteCloud)
+        if self.conn and self.db_type == "cloud" and self._last_connection_time:
+            elapsed = (datetime.now() - self._last_connection_time).total_seconds()
+            if elapsed > self._connection_timeout:
+                logger.info("⏰ Connection timeout reached, refreshing SQLiteCloud connection...")
+                self.conn = None
+        
         if self.conn and self.db_type != "memory":
             try:
-                await asyncio.to_thread(self.conn.execute, "SELECT 1")
+                # Use a simple query to test connection health
+                if self.db_type == "cloud":
+                    # For SQLiteCloud, execute and fetch immediately
+                    cursor = await asyncio.to_thread(self.conn.execute, "SELECT 1")
+                    await asyncio.to_thread(cursor.fetchone)
+                else:
+                    await asyncio.to_thread(self.conn.execute, "SELECT 1")
                 return
-            except Exception:
-                logger.warning("⚠️ Database connection health check failed. Reconnecting...")
+            except Exception as e:
+                logger.warning(f"⚠️ Database connection health check failed ({e}). Reconnecting...")
                 self.conn = None
                 self.db_type = "memory"
         
@@ -176,6 +191,7 @@ class ResilientDatabaseManager:
             try:
                 self.conn = await asyncio.to_thread(sqlitecloud.connect, self.connection_string)
                 self.db_type = "cloud"
+                self._last_connection_time = datetime.now()
                 logger.info("✅ Connected to SQLite Cloud.")
             except Exception as e:
                 logger.error(f"❌ SQLite Cloud connection failed: {e}. Falling back...")
@@ -346,7 +362,10 @@ class ResilientDatabaseManager:
             return None
 
     async def save_session(self, session: UserSession):
+        """Save session with connection retry logic."""
+        # Always ensure connection before saving
         await self._ensure_connection()
+        
         if self.db_type == "memory":
             self.local_sessions[session.session_id] = copy.deepcopy(session)
             return
@@ -398,60 +417,104 @@ class ResilientDatabaseManager:
         columns = ', '.join(session_dict.keys())
         placeholders = ', '.join(['?'] * len(session_dict))
         
-        try:
-            await asyncio.to_thread(
-                self.conn.execute,
-                f"INSERT OR REPLACE INTO sessions ({columns}) VALUES ({placeholders})",
-                tuple(session_dict.values())
-            )
-            await asyncio.to_thread(self.conn.commit)
-        except Exception as e:
-            logger.error(f"❌ Failed to save session {session.session_id[:8]}: {e}", exc_info=True)
-            logger.warning(f"⚠️ Saved session {session.session_id[:8]} to memory as fallback.")
-            self.local_sessions[session.session_id] = copy.deepcopy(session)
+        max_retries = 2
+        for attempt in range(max_retries):
+            try:
+                await asyncio.to_thread(
+                    self.conn.execute,
+                    f"INSERT OR REPLACE INTO sessions ({columns}) VALUES ({placeholders})",
+                    tuple(session_dict.values())
+                )
+                await asyncio.to_thread(self.conn.commit)
+                return  # Success
+            except Exception as e:
+                logger.error(f"❌ Failed to save session {session.session_id[:8]} (attempt {attempt + 1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    # Reset connection and try again
+                    self.conn = None
+                    await self._ensure_connection()
+                else:
+                    # Final failure, save to memory
+                    logger.warning(f"⚠️ Saved session {session.session_id[:8]} to memory as fallback.")
+                    self.local_sessions[session.session_id] = copy.deepcopy(session)
 
     async def cleanup_expired_sessions(self, expiry_minutes: int = 5, limit: int = 10):
+        """Cleanup expired sessions with better connection handling."""
         logger.info(f"🧹 Starting cleanup for sessions inactive for >{expiry_minutes}m.")
+        
+        # Ensure fresh connection before starting
         await self._ensure_connection()
+        
         if self.db_type == "memory":
             logger.warning("Cleanup skipped: in-memory mode does not support automated cleanup.")
             return {"success": False, "reason": "in_memory_mode"}
         
         cutoff_iso = (datetime.now() - timedelta(minutes=expiry_minutes)).isoformat()
+        
         try:
-            # Set row factory only for regular SQLite
-            if self.db_type == "file":
-                self.conn.row_factory = sqlite3.Row
+            # For SQLiteCloud, we need to handle the connection more carefully
+            if self.db_type == "cloud":
+                # Execute and fetch in one operation to minimize connection time
+                cursor = await asyncio.to_thread(
+                    self.conn.execute,
+                    "SELECT * FROM sessions WHERE active = 1 AND last_activity < ? ORDER BY last_activity ASC LIMIT ?",
+                    (cutoff_iso, limit)
+                )
+                # Fetch all rows immediately to avoid connection timeout
+                rows = await asyncio.to_thread(cursor.fetchall)
                 
-            cursor = await asyncio.to_thread(
-                self.conn.execute,
-                "SELECT * FROM sessions WHERE active = 1 AND last_activity < ? ORDER BY last_activity ASC LIMIT ?",
-                (cutoff_iso, limit)
-            )
-            rows = await asyncio.to_thread(cursor.fetchall)
-            
-            # Reset row factory
-            if self.db_type == "file":
-                self.conn.row_factory = None
-            
-            cleaned_count = 0
-            for row in rows:
-                row_dict = self._row_to_dict(cursor, row)
-                session = self._build_session_from_row(row_dict)
-                
-                if is_crm_eligible(session):
-                    # Save to CRM before deactivating
-                    save_result = await zoho_manager.save_chat_transcript(session, "Automated Session Timeout Cleanup")
-                    session.timeout_saved_to_crm = save_result.get("success", False)
+                cleaned_count = 0
+                for row in rows:
+                    # Convert row to dict for cloud connections
+                    row_dict = self._row_to_dict(cursor, row)
+                    session = self._build_session_from_row(row_dict)
+                    
+                    if session and is_crm_eligible(session):
+                        # Save to CRM before deactivating
+                        if zoho_manager:  # Check if zoho_manager is available
+                            save_result = await zoho_manager.save_chat_transcript(session, "Automated Session Timeout Cleanup")
+                            session.timeout_saved_to_crm = save_result.get("success", False)
 
-                session.active = False
-                await self.save_session(session)
-                cleaned_count += 1
+                    if session:
+                        session.active = False
+                        # Re-ensure connection before saving
+                        await self._ensure_connection()
+                        await self.save_session(session)
+                        cleaned_count += 1
+            else:
+                # Original logic for file-based SQLite
+                self.conn.row_factory = sqlite3.Row
+                cursor = await asyncio.to_thread(
+                    self.conn.execute,
+                    "SELECT * FROM sessions WHERE active = 1 AND last_activity < ? ORDER BY last_activity ASC LIMIT ?",
+                    (cutoff_iso, limit)
+                )
+                rows = await asyncio.to_thread(cursor.fetchall)
+                self.conn.row_factory = None
+                
+                cleaned_count = 0
+                for row in rows:
+                    row_dict = self._row_to_dict(cursor, row)
+                    session = self._build_session_from_row(row_dict)
+                    
+                    if session and is_crm_eligible(session):
+                        if zoho_manager:
+                            save_result = await zoho_manager.save_chat_transcript(session, "Automated Session Timeout Cleanup")
+                            session.timeout_saved_to_crm = save_result.get("success", False)
+
+                    if session:
+                        session.active = False
+                        await self.save_session(session)
+                        cleaned_count += 1
             
             logger.info(f"✅ Cleanup complete. Processed {cleaned_count} sessions.")
             return {"success": True, "cleaned_up_count": cleaned_count}
+            
         except Exception as e:
             logger.error(f"❌ Failed to cleanup expired sessions: {e}", exc_info=True)
+            # Try to reset connection for next use
+            self.conn = None
+            self.db_type = "memory"
             return {"success": False, "error": str(e)}
 
 class PDFExporter:
