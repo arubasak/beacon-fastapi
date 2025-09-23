@@ -29,49 +29,7 @@ from reportlab.lib.enums import TA_CENTER
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="FiFi Backend API", version="4.0.5") # Updated version
-
-# Corrected CORS Configuration
-origins = [
-    "https://fifi-eu.streamlit.app", # Your primary Streamlit app URL
-    "https://www.12taste.com",       # Potential embedding domain
-    "https://12taste.com",           # Another variation
-    # Adding the specific Cloud Run referrer URL from your logs for robustness.
-    # It's generally better to allow the Streamlit app's direct URL rather than Cloud Run's internal URL,
-    # but including it here as a safeguard since it appeared in referer.
-    "https://fifi-eu-121263692901.europe-west1.run.app", 
-    # "http://localhost:8501" # Uncomment for local development
-]
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["*"],
-)
-
-# Configuration from environment variables
-SQLITE_CLOUD_CONNECTION = os.getenv("SQLITE_CLOUD_CONNECTION")
-ZOHO_CLIENT_ID = os.getenv("ZOHO_CLIENT_ID")
-ZOHO_CLIENT_SECRET = os.getenv("ZOHO_CLIENT_SECRET")
-ZOHO_REFRESH_TOKEN = os.getenv("ZOHO_REFRESH_TOKEN")
-ZOHO_ENABLED = all([ZOHO_CLIENT_ID, ZOHO_CLIENT_SECRET, ZOHO_REFRESH_TOKEN])
-
-SQLITECLOUD_AVAILABLE = False
-try:
-    import sqlitecloud
-    SQLITECLOUD_AVAILABLE = True
-    logger.info("✅ sqlitecloud SDK detected.")
-except ImportError:
-    logger.warning("❌ SQLiteCloud SDK not available. Local file/memory fallback will be used.")
-
-db_manager = None
-pdf_exporter = None
-zoho_manager = None
-
-
-# --- START: ADDED ERROR HANDLING SYSTEM (Ensured correct placement) ---
+# --- 2. Error Handling System (MUST BE DEFINED BEFORE ANY USAGE) ---
 
 class ErrorSeverity(Enum):
     LOW = "low"
@@ -145,10 +103,50 @@ def handle_api_errors(component: str, operation: str):
         return wrapper
     return decorator
 
-# --- END: ADDED ERROR HANDLING SYSTEM ---
+# --- 3. FastAPI App Initialization ---
 
+app = FastAPI(title="FiFi Backend API", version="4.0.5") # Updated version
 
-# --- 2. Pydantic Models & Data Classes ---
+# Corrected CORS Configuration
+origins = [
+    "https://fifi-eu.streamlit.app", # Your primary Streamlit app URL
+    "https://www.12taste.com",       # Potential embedding domain
+    "https://12taste.com",           # Another variation
+    # Adding the specific Cloud Run referrer URL from your logs for robustness.
+    # It's generally better to allow the Streamlit app's direct URL rather than Cloud Run's internal URL,
+    # but including it here as a safeguard since it appeared in referer.
+    "https://fifi-eu-121263692901.europe-west1.run.app", 
+    # "http://localhost:8501" # Uncomment for local development
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+)
+
+# Configuration from environment variables
+SQLITE_CLOUD_CONNECTION = os.getenv("SQLITE_CLOUD_CONNECTION")
+ZOHO_CLIENT_ID = os.getenv("ZOHO_CLIENT_ID")
+ZOHO_CLIENT_SECRET = os.getenv("ZOHO_CLIENT_SECRET")
+ZOHO_REFRESH_TOKEN = os.getenv("ZOHO_REFRESH_TOKEN")
+ZOHO_ENABLED = all([ZOHO_CLIENT_ID, ZOHO_CLIENT_SECRET, ZOHO_REFRESH_TOKEN])
+
+SQLITECLOUD_AVAILABLE = False
+try:
+    import sqlitecloud
+    SQLITECLOUD_AVAILABLE = True
+    logger.info("✅ sqlitecloud SDK detected.")
+except ImportError:
+    logger.warning("❌ SQLiteCloud SDK not available. Local file/memory fallback will be used.")
+
+db_manager = None
+pdf_exporter = None
+zoho_manager = None
+
+# --- 4. Pydantic Models & Data Classes ---
 
 class EmergencySaveRequest(BaseModel):
     session_id: str
@@ -224,7 +222,7 @@ class UserSession:
     is_degraded_login: bool = False
     degraded_login_timestamp: Optional[datetime] = None
 
-# --- 3. Core Service Classes (Database, PDF, CRM) ---
+# --- 5. Core Service Classes (Database, PDF, CRM) ---
 
 def safe_json_loads(data: Optional[str], default_value: Any = None) -> Any:
     """Safely decode a JSON string, returning a default value on failure."""
@@ -850,7 +848,7 @@ class ZohoCRMManager:
                 
         return note_content
 
-# --- 4. Helper Functions & Background Tasks ---
+# --- 6. Helper Functions & Background Tasks ---
 
 def is_crm_eligible(session: UserSession) -> bool:
     """Determine if a session is eligible for saving to CRM."""
@@ -893,7 +891,7 @@ async def _perform_full_cleanup_in_background():
     await db_manager.cleanup_expired_sessions(expiry_minutes=5) 
     logger.info("Background task finished: Full cleanup.")
 
-# --- 5. FastAPI Startup & API Endpoints ---
+# --- 7. FastAPI Startup & API Endpoints ---
 
 @app.on_event("startup")
 async def startup_event():
@@ -996,7 +994,7 @@ async def receive_fingerprint(payload: FingerprintPayload):
         logger.error(f"❌ Failed to process fingerprint for session {payload.session_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error while processing fingerprint")
 
-# --- 6. Main Execution Block ---
+# --- 8. Main Execution Block ---
 
 if __name__ == "__main__":
     import uvicorn
