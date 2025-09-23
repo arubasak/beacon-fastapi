@@ -12,30 +12,40 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Any
 from enum import Enum
 from dataclasses import dataclass, field
+import io
+import re
+import html
+import functools
 
 # Reportlab is synchronous, so it needs to be imported here and run in asyncio.to_thread
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.pagesizes import letter
-from reportlab.lib.colors import lightgrey
+from reportlab.lib.colors import lightgrey, grey
+from reportlab.lib.enums import TA_CENTER
 
 # --- 1. Configuration & Logging ---
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="FiFi Backend API", version="4.0.2")
+app = FastAPI(title="FiFi Backend API", version="4.0.4") # Updated version
 
-# IMPORTANT: Adjust allow_origins for your production environment
-# It should include the domain where Streamlit is embedded (12taste.com)
-# And the Streamlit app's direct Cloud Run URL
+# Corrected CORS Configuration
+origins = [
+    "https://fifi-eu.streamlit.app",
+    "https://www.12taste.com",
+    "https://12taste.com",
+    "https://fifi-eu-121263692901.europe-west1.run.app/",
+    # "http://localhost:8501" # Uncomment for local development
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://fifi-eu-121263692901.europe-west1.run.app", "https://www.12taste.com", "https://12taste.com", "*"],
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
-    max_age=3600,
 )
 
 # Configuration from environment variables
@@ -56,6 +66,85 @@ except ImportError:
 db_manager = None
 pdf_exporter = None
 zoho_manager = None
+
+
+# --- START: ADDED ERROR HANDLING SYSTEM ---
+
+class ErrorSeverity(Enum):
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    CRITICAL = "critical"
+
+@dataclass
+class ErrorContext:
+    component: str
+    operation: str
+    error_type: str
+    severity: ErrorSeverity
+    technical_details: str
+
+class EnhancedErrorHandler:
+    """A simplified error handler for the FastAPI backend, focused on logging."""
+    def __init__(self):
+        self.component_status = {}
+
+    def handle_api_error(self, component: str, operation: str, error: Exception) -> ErrorContext:
+        error_str = str(error).lower()
+        if "timeout" in error_str:
+            severity = ErrorSeverity.MEDIUM
+        elif "unauthorized" in error_str or "401" in error_str or "403" in error_str:
+            severity = ErrorSeverity.HIGH
+        elif "rate limit" in error_str or "429" in error_str:
+            severity = ErrorSeverity.MEDIUM
+        elif "connection" in error_str or "network" in error_str:
+            severity = ErrorSeverity.HIGH
+        else:
+            severity = ErrorSeverity.MEDIUM
+
+        return ErrorContext(
+            component=component, operation=operation, error_type=type(error).__name__,
+            severity=severity, technical_details=str(error)
+        )
+
+    def log_error(self, error_context: ErrorContext):
+        self.component_status[error_context.component] = "error"
+        logger.error(
+            f"API Error in {error_context.component}/{error_context.operation}: "
+            f"Severity: {error_context.severity.value}, Details: {error_context.technical_details}",
+            exc_info=True
+        )
+
+    def mark_component_healthy(self, component: str):
+        self.component_status[component] = "healthy"
+
+error_handler = EnhancedErrorHandler()
+
+def handle_api_errors(component: str, operation: str):
+    """Decorator to handle API errors, simplified for backend logging."""
+    def decorator(func):
+        @functools.wraps(func)
+        async def wrapper(*args, **kwargs):
+            try:
+                # Support both async and sync functions
+                if asyncio.iscoroutinefunction(func):
+                    result = await func(*args, **kwargs)
+                else:
+                    result = func(*args, **kwargs)
+                error_handler.mark_component_healthy(component)
+                return result
+            except Exception as e:
+                error_context = error_handler.handle_api_error(component, operation, e)
+                error_handler.log_error(error_context)
+                # In FastAPI, we typically raise HTTPException instead of returning None
+                # But for background tasks, returning None is fine.
+                # For simplicity and to match the original logic, we will return None for now.
+                return None
+        return wrapper
+    return decorator
+
+# --- END: ADDED ERROR HANDLING SYSTEM ---
+
 
 # --- 2. Pydantic Models & Data Classes ---
 
@@ -551,7 +640,7 @@ class PDFExporter:
             buffer = io.BytesIO()
             doc = SimpleDocTemplate(buffer, pagesize=letter)
             story = [
-                Paragraph("FiFi AI Chat Transcript", self.styles['Heading1']),
+                Paragraph("FiFi AI Chat Transcript", self.styles['ChatHeader']),
                 Paragraph(f"Session ID: {session.session_id}", self.styles['Normal']),
                 Paragraph(f"User: {session.full_name or 'Anonymous'} ({session.email or 'No email'})", self.styles['Normal']),
                 Paragraph(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", self.styles['Normal']),
