@@ -6,7 +6,7 @@ import os
 import json
 import sqlite3
 import copy
-import httpx
+import httpx # Ensure httpx is imported
 import asyncio
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Any
@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 import io
 import re
 import html
-import functools
+import functools # Ensure functools is imported
 
 # Reportlab is synchronous, so it needs to be imported here and run in asyncio.to_thread
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
@@ -29,14 +29,17 @@ from reportlab.lib.enums import TA_CENTER
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="FiFi Backend API", version="4.0.4") # Updated version
+app = FastAPI(title="FiFi Backend API", version="4.0.5") # Updated version
 
 # Corrected CORS Configuration
 origins = [
-    "https://fifi-eu.streamlit.app",
-    "https://www.12taste.com",
-    "https://12taste.com",
-    "https://fifi-eu-121263692901.europe-west1.run.app/",
+    "https://fifi-eu.streamlit.app", # Your primary Streamlit app URL
+    "https://www.12taste.com",       # Potential embedding domain
+    "https://12taste.com",           # Another variation
+    # Adding the specific Cloud Run referrer URL from your logs for robustness.
+    # It's generally better to allow the Streamlit app's direct URL rather than Cloud Run's internal URL,
+    # but including it here as a safeguard since it appeared in referer.
+    "https://fifi-eu-121263692901.europe-west1.run.app", 
     # "http://localhost:8501" # Uncomment for local development
 ]
 
@@ -68,7 +71,7 @@ pdf_exporter = None
 zoho_manager = None
 
 
-# --- START: ADDED ERROR HANDLING SYSTEM ---
+# --- START: ADDED ERROR HANDLING SYSTEM (Ensured correct placement) ---
 
 class ErrorSeverity(Enum):
     LOW = "low"
@@ -136,9 +139,8 @@ def handle_api_errors(component: str, operation: str):
             except Exception as e:
                 error_context = error_handler.handle_api_error(component, operation, e)
                 error_handler.log_error(error_context)
-                # In FastAPI, we typically raise HTTPException instead of returning None
-                # But for background tasks, returning None is fine.
-                # For simplicity and to match the original logic, we will return None for now.
+                # For FastAPI endpoints, we typically raise HTTPException to return an error response.
+                # For functions called within background tasks (like PDFExporter), returning None is okay.
                 return None
         return wrapper
     return decorator
@@ -885,7 +887,10 @@ async def _perform_emergency_crm_save(session_id: str, reason: str):
 async def _perform_full_cleanup_in_background():
     """Background task for cleaning up all expired sessions."""
     logger.info("Background task started: Full cleanup of expired sessions.")
-    await db_manager.cleanup_expired_sessions(expiry_minutes=5)
+    # You need to pass the actual configured expiry minutes from production_config
+    # Assuming a constant for it in FastAPI's environment or a configuration object similar to Streamlit
+    # For now, keeping 5 minutes as it was. If you have a different setting in production_config, use that.
+    await db_manager.cleanup_expired_sessions(expiry_minutes=5) 
     logger.info("Background task finished: Full cleanup.")
 
 # --- 5. FastAPI Startup & API Endpoints ---
@@ -898,11 +903,13 @@ async def startup_event():
     pdf_exporter = PDFExporter()
     db_manager = ResilientDatabaseManager(os.getenv("SQLITE_CLOUD_CONNECTION"))
     zoho_manager = ZohoCRMManager(pdf_exporter)
-    await db_manager.test_connection()
+    # The test_connection call here ensures the DB is connected and schema is initialized on startup.
+    await db_manager.test_connection() 
     logger.info(f"✅ FastAPI startup complete. DB Mode: {db_manager.db_type}, Zoho Enabled: {ZOHO_ENABLED}")
 
 @app.options("/{path:path}")
 async def options_handler(path: str):
+    """Handles CORS preflight requests."""
     return {"status": "ok"}
 
 @app.get("/")
