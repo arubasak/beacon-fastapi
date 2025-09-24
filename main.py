@@ -16,6 +16,7 @@ import io
 import re
 import html
 import functools # Ensure functools is imported
+from html.parser import HTMLParser
 
 # Reportlab is synchronous, so it needs to be imported here and run in asyncio.to_thread
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
@@ -593,6 +594,54 @@ class ResilientDatabaseManager:
             self.db_type = "memory"
             return {"success": False, "error": str(e)}
 
+# HTML Tag Balancer for PDF Generation
+class HTMLTagBalancer(HTMLParser):
+    """Helper class to balance HTML tags and ensure they're properly closed."""
+    def __init__(self):
+        super().__init__()
+        self.stack = []
+        self.output = []
+    
+    def handle_starttag(self, tag, attrs):
+        if tag in ['b', 'i', 'u']:  # Only track formatting tags
+            self.stack.append(tag)
+        self.output.append(self.get_starttag_text())
+    
+    def handle_endtag(self, tag):
+        if tag in ['b', 'i', 'u'] and self.stack and self.stack[-1] == tag:
+            self.stack.pop()
+        self.output.append(f'</{tag}>')
+    
+    def handle_data(self, data):
+        self.output.append(data)
+    
+    def get_balanced_html(self):
+        # Close any unclosed tags
+        result = ''.join(self.output)
+        for tag in reversed(self.stack):
+            result += f'</{tag}>'
+        return result
+
+def safe_markdown_to_html(content: str) -> str:
+    """Convert markdown-style formatting to HTML tags safely."""
+    # Escape HTML first to prevent injection
+    content = html.escape(content)
+    
+    # Handle bold markdown (**text** or __text__)
+    # Replace **text** with <b>text</b>
+    content = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', content)
+    content = re.sub(r'__(.+?)__', r'<b>\1</b>', content)
+    
+    # Handle italic markdown (*text* or _text_)
+    # Make sure not to match bold markers
+    content = re.sub(r'(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)', r'<i>\1</i>', content)
+    content = re.sub(r'(?<!_)_(?!_)(.+?)(?<!_)_(?!_)', r'<i>\1</i>', content)
+    
+    # Balance HTML tags
+    balancer = HTMLTagBalancer()
+    balancer.feed(content)
+    return balancer.get_balanced_html()
+
 class PDFExporter:
     """Generates PDF chat transcripts."""
     def __init__(self):
@@ -652,13 +701,29 @@ class PDFExporter:
                  story.append(Spacer(1, 8))
 
             for msg in messages_to_include:
-                content = html.escape(str(msg.get('content', '')))
-                content = re.sub(r'<[^>]+>', '', content)
-                content = content.replace('**', '<b>').replace('__', '<b>')
-                content = content.replace('*', '<i>').replace('_', '<i>')
+                # Get raw content
+                raw_content = str(msg.get('content', ''))
+                
+                # Remove any existing HTML tags for safety
+                clean_content = re.sub(r'<[^>]+>', '', raw_content)
+                
+                # Convert markdown to HTML safely
+                formatted_content = safe_markdown_to_html(clean_content)
+                
                 role = msg.get('role', 'unknown').capitalize()
                 style = self.styles['UserMessage'] if role == 'User' else self.styles['Normal']
-                story.extend([Spacer(1, 8), Paragraph(f"<b>{role}:</b> {content}", style)])
+                
+                try:
+                    # Try to create the paragraph with formatted content
+                    para = Paragraph(f"<b>{role}:</b> {formatted_content}", style)
+                    story.extend([Spacer(1, 8), para])
+                except Exception as e:
+                    # If formatting fails, fall back to plain text
+                    logger.warning(f"Failed to format message, using plain text: {e}")
+                    # Re-escape the content for plain text display
+                    plain_content = html.escape(clean_content)
+                    para = Paragraph(f"<b>{role}:</b> {plain_content}", style)
+                    story.extend([Spacer(1, 8), para])
             
             await asyncio.to_thread(doc.build, story)
             buffer.seek(0)
